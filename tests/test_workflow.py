@@ -201,7 +201,7 @@ class WorkflowTests(unittest.TestCase):
             self.workflow.run_task(self.store)  # Wrong coordinator kind for the Claude task.
 
     def test_managed_coordinator_receives_final_review_not_external_claude(self):
-        store = self.workflow.create("Final gate", "task-gate", coordinator={"kind": "opencode", "model": "aihub/kimi-k3"})
+        store = self.workflow.create("Final gate", "task-gate", coordinator={"kind": "opencode", "model": "example/kimi-test"})
         handoff = store.root / "handoff.md"
         handoff.write_text(handoff.read_text().replace("<!-- Claude coordinator: replace this placeholder. -->", "Deliver the feature."))
         (store.root / "brief.md").write_text("Deliver the full final-gate request.\n")
@@ -230,7 +230,7 @@ class WorkflowTests(unittest.TestCase):
         codex_task = self.workflow.create("Use the default", "task-default-codex")
         self.assertEqual("codex", codex_task.read()["coordinator"]["kind"])
         self.assertEqual("gpt-6-sol", codex_task.read()["coordinator"]["model"])
-        self.workflow.config["agents"]["coordinator"] = {"kind": "opencode", "model": "aihub/kimi-k3", "variant": None}
+        self.workflow.config["agents"]["coordinator"] = {"kind": "opencode", "model": "example/kimi-test", "variant": None}
         opencode_task = self.workflow.create("New global default", "task-default-opencode")
         self.assertEqual("opencode", opencode_task.read()["coordinator"]["kind"])
         self.assertEqual("codex", codex_task.read()["coordinator"]["kind"])
@@ -238,7 +238,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIsNone(changed_kind["model"])
 
     def test_plan_only_coordinator_stops_after_handoff(self):
-        store = self.workflow.create("Only plan", "task-plan-only", coordinator={"kind": "opencode", "model": "aihub/kimi-k3"}, plan_only=True)
+        store = self.workflow.create("Only plan", "task-plan-only", coordinator={"kind": "opencode", "model": "example/kimi-test"}, plan_only=True)
         (store.root / "brief.md").write_text("Write a plan; do not implement yet.\n")
         self.workflow.start_coordinator(store)
         self.assertFalse(store.read()["planning"]["auto_start"])
@@ -283,10 +283,10 @@ class WorkflowTests(unittest.TestCase):
         self.assertTrue((root / "skills/herdr-flow/references/planning.md").is_file())
 
     def test_opencode_coordinator_uses_pinned_model(self):
-        store = self.workflow.create("OpenCode coordination", "task-opencode", coordinator={"kind": "opencode", "model": "aihub/kimi-k3", "variant": "high"})
+        store = self.workflow.create("OpenCode coordination", "task-opencode", coordinator={"kind": "opencode", "model": "example/kimi-test", "variant": "high"})
         (store.root / "brief.md").write_text("Full original OpenCode request.\n")
         self.workflow.start_coordinator(store)
-        self.assertEqual(["--model", "aihub/kimi-k3", "--variant", "high"], self.fake.start_args["coordinator"])
+        self.assertEqual(["--model", "example/kimi-test", "--variant", "high"], self.fake.start_args["coordinator"])
         self.assertEqual("opencode", store.read()["coordinator"]["kind"])
 
     def test_two_projects_same_task_id_have_distinct_agents_and_registry_entries(self):
@@ -651,12 +651,12 @@ class WorkflowTests(unittest.TestCase):
             "Configured task",
             "task-configured-002",
             worker={"kind": "codex", "model": "gpt-5.6-sol", "variant": "high"},
-            reviewer={"kind": "opencode", "model": "aihub/kimi-k3"},
+            reviewer={"kind": "opencode", "model": "example/kimi-test"},
         )
         state = store.read()
         self.assertEqual({"kind": "codex", "model": "gpt-5.6-sol", "variant": "high"}, {key: state["worker"].get(key) for key in ("kind", "model", "variant")})
         self.assertEqual("opencode", state["reviewer"]["kind"])
-        self.assertEqual("aihub/kimi-k3", state["reviewer"]["model"])
+        self.assertEqual("example/kimi-test", state["reviewer"]["model"])
 
     def test_codex_worker_receives_model_and_reasoning_effort(self):
         self.workflow.configure_role(self.store, "worker", kind="codex", model="gpt-5.6-sol", variant="high", variant_set=True)
@@ -664,11 +664,11 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual(["-m", "gpt-5.6-sol", "-c", 'model_reasoning_effort="high"'], self.fake.start_args["worker"])
 
     def test_opencode_reviewer_receives_model_and_variant(self):
-        self.workflow.configure_role(self.store, "reviewer", kind="opencode", model="aihub/kimi-k3", variant="high", variant_set=True)
+        self.workflow.configure_role(self.store, "reviewer", kind="opencode", model="example/kimi-test", variant="high", variant_set=True)
         self.workflow.implement(self.store)
         self.mark_implementation_ready()
         self.workflow.review(self.store)
-        self.assertEqual(["--model", "aihub/kimi-k3", "--variant", "high"], self.fake.start_args["reviewer"])
+        self.assertEqual(["--model", "example/kimi-test", "--variant", "high"], self.fake.start_args["reviewer"])
 
     def test_agent_selection_is_immutable_after_session_start(self):
         self.workflow.implement(self.store)

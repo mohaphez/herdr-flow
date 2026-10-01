@@ -13,6 +13,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python-version }}
+      - name: Check marketplace setup dependency
+        run: command -v jq
       - name: Check shell syntax
         run: bash -n install.sh bin/herdr-flow
       - name: Python syntax and unit tests

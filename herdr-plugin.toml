@@ -11,6 +11,13 @@ title = "AI workflow: status"
 contexts = ["global"]
 command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" status-popup"]
 
+# GitHub installs register Herdr entrypoints; users explicitly opt in to local CLI/agent links.
+[[actions]]
+id = "setup"
+title = "AI workflow: set up CLI and agent entry points"
+contexts = ["global"]
+command = ["bash", "-c", "exec bash \"$HERDR_PLUGIN_ROOT/install.sh\""]
+
 [[actions]]
 id = "implement"
 title = "AI workflow: start or reuse worker"

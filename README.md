@@ -2,7 +2,7 @@
 
 File-backed, persistent multi-agent development workflow for [Herdr](https://herdr.dev). A Claude Code, Codex, or OpenCode coordinator plans a task and performs its final release review. Independent OpenCode/Codex sessions implement, review, and repair in a task-specific Git worktree. **No automatic commit or merge.** Worktree cleanup requires a verified merge, a clean checkout, and ownership checks.
 
-> **Status:** Automated state-machine tests pass; the full live three-harness acceptance scenario in `ACCEPTANCE.md` remains to be performed inside Herdr. Do not assume race-free operation or unattended production readiness from unit tests alone.
+> **v0.8.0 prerelease:** Automated state-machine tests pass; the full live three-harness acceptance scenario in `ACCEPTANCE.md` remains to be performed inside Herdr. The marketplace is an **unreviewed community index**, not a security or quality endorsement. Do not assume race-free operation or unattended production readiness from unit tests alone.
 
 ## Workflow at a glance
 
@@ -39,7 +39,24 @@ A blocked agent stays in its existing pane. An uncertain prompt is **never** aut
 
 Linux, Python 3.10+ (tested with 3.14), Git, Herdr 0.9.1+, Claude Code, OpenCode, Codex, and `jq`. Model IDs must be available in your installed OpenCode/Codex catalogs. The plugin uses `hessam.herdr-flow` as its stable Herdr identifier; it does not contain credentials.
 
-## Install
+## Install from the Herdr marketplace (recommended for new users)
+
+The marketplace lists public repositories with the `herdr-plugin` GitHub topic and a valid manifest on their default branch. It does not host, vet, or sandbox plugin code. Inspect the [manifest](herdr-plugin.toml), [setup script](install.sh), and source before installing. From a **Herdr-managed pane** on Linux, with the requirements above installed:
+
+```bash
+herdr plugin install mohaphez/herdr-flow --ref v0.8.0
+herdr plugin action invoke hessam.herdr-flow.setup
+herdr plugin log list --plugin hessam.herdr-flow --limit 5
+herdr-flow doctor
+```
+
+`plugin install` clones and registers the manifest actions, events, and status pane. It **does not** add `herdr-flow` to your shell or install Claude/OpenCode/Codex commands and skills. The explicit `setup` action runs this repository's [install.sh](install.sh) as your user, from Herdr: it checks existing ownership, seeds private config if missing, and links the CLI and agent entry points. It is safe to rerun for the same plugin root and refuses to replace an unrelated or stale link. Action invocation returns a log record before the command may finish; check the plugin log and that `herdr-flow` is available before running `doctor`. `doctor` reports any unset models; set them in your private config before creating tasks. No build/startup hook silently edits your home directory.
+
+Herdr exposes the plugin without setup through `herdr plugin action list --plugin hessam.herdr-flow` and `herdr plugin pane open --plugin hessam.herdr-flow --entrypoint status`. Once setup completes and models are configured, start a task using the planning commands below or `herdr-flow create` **inside Herdr**. The [marketplace documentation](https://herdr.dev/docs/marketplace/) explains discovery: the `herdr-plugin` topic and this default-branch manifest drive indexing, not the GitHub release or tag; refreshes occur about every 30 minutes. A listing is not a Herdr review or endorsement.
+
+Use `herdr plugin config-dir hessam.herdr-flow` to locate the private config directory. After an upgrade/reinstall, inspect existing tasks first and rerun `setup` if the managed checkout path changed; if old symlinks still point at a retired checkout, inspect their ownership and remove only verified stale links before setup. Never install over a different linked checkout or interrupt its live tasks. `--ref v0.8.0` pins this prerelease; omit `--ref` only when you deliberately want the current default-branch version. Herdr has no separate `plugin update` in v1: it reinstalls from GitHub.
+
+### Local development or standalone checkout
 
 Clone into a **standalone repository**, for example:
 
@@ -47,7 +64,7 @@ Clone into a **standalone repository**, for example:
 git clone https://github.com/mohaphez/herdr-flow.git ~/projects/github/herdr-flow
 ```
 
-From a **Herdr-managed pane**, run `~/projects/github/herdr-flow/install.sh`. The installer checks ownership, links the local repository as the Herdr plugin, and links CLI, command, and skill entry points; it does not copy plugin source, overwrite another installation, or rewrite existing user-owned files. Never run it from an external terminal to manipulate live Herdr sessions. If another Herdr Flow installation is active, complete/inspect its tasks before explicitly migrating from a Herdr pane; do not change its live ownership or delete its worktrees.
+From a **Herdr-managed pane**, run `~/projects/github/herdr-flow/install.sh`. The same guarded setup script links the local repository as the Herdr plugin if necessary and links CLI, command, and skill entry points; it does not copy plugin source, overwrite another installation, or rewrite existing user-owned files. Never run it from an external terminal to manipulate live Herdr sessions. If another Herdr Flow installation is active, complete/inspect its tasks before explicitly migrating from a Herdr pane; do not change its live ownership or delete its worktrees.
 
 Herdr Flow keeps a **private** runtime config at `~/.config/herdr/plugins/config/hessam.herdr-flow/config.json` (or use `HERDR_FLOW_CONFIG=/absolute/path/to/private-config.json`). The installer creates that file with mode `0600` only when it does not already exist. The tracked `config.json` is a portable template, **not** your credential or model catalog. Set the worker and reviewer to exact models available on your machine before creating tasks; optionally enable an escalation fixer and change the default coordinator. Example (replace model IDs with real catalog IDs):
 
