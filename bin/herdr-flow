@@ -1,0 +1,5 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+script=$(readlink -f "${BASH_SOURCE[0]}")
+root=$(cd "$(dirname "$script")/.." && pwd)
+exec python3 "$root/src/herdr_flow.py" "$@"

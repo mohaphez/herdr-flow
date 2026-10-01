@@ -1,0 +1,21 @@
+name: tests
+on:
+  push:
+  pull_request:
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ['3.10', '3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Check shell syntax
+        run: bash -n install.sh bin/herdr-flow
+      - name: Python syntax and unit tests
+        run: |
+          python -m py_compile src/herdr_flow.py
+          python -m unittest discover -s tests -v

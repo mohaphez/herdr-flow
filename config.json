@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "workflow": {
+    "reuse_worker_sessions": true,
+    "reuse_reviewer_sessions": true,
+    "human_in_the_loop": true,
+    "auto_merge": false,
+    "auto_remove_worktrees": false,
+    "prompt_timeout_ms": 300000
+  },
+  "agents": {
+    "coordinator": {
+      "kind": "claude",
+      "model": null,
+      "variant": null
+    },
+    "worker": {
+      "kind": "opencode",
+      "model": null,
+      "variant": null
+    },
+    "reviewer": {
+      "kind": "opencode",
+      "model": null,
+      "variant": null
+    }
+  },
+  "repair": {
+    "escalation": {
+      "enabled": false,
+      "after_failures": 3,
+      "agent": {
+        "kind": "codex",
+        "model": null,
+        "variant": null
+      }
+    }
+  },
+  "git": {
+    "branch_prefix": "ai/",
+    "base_ref": "HEAD",
+    "require_human_merge": true
+  },
+  "review": {
+    "require_explicit_pass": true
+  },
+  "recovery": {
+    "recreate_dead_sessions": true,
+    "require_file_context": true
+  },
+  "security": {
+    "deny_secret_patterns": true
+  }
+}

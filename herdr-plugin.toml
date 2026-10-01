@@ -1,0 +1,68 @@
+id = "hessam.herdr-flow"
+name = "Herdr Flow"
+version = "0.7.0"
+min_herdr_version = "0.9.1"
+description = "Persistent task-owned Claude, Codex, or OpenCode coordination with independent implementation, review, and repair roles."
+platforms = ["linux"]
+
+[[actions]]
+id = "status"
+title = "AI workflow: status"
+contexts = ["global"]
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" status-popup"]
+
+[[actions]]
+id = "implement"
+title = "AI workflow: start or reuse worker"
+contexts = ["workspace"]
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" implement"]
+
+[[actions]]
+id = "review"
+title = "AI workflow: start or reuse reviewer"
+contexts = ["workspace"]
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" review"]
+
+[[actions]]
+id = "fix"
+title = "AI workflow: route findings to repair agent"
+contexts = ["workspace"]
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" fix"]
+
+[[actions]]
+id = "resume"
+title = "AI workflow: resume or recover"
+contexts = ["workspace"]
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" resume"]
+
+[[panes]]
+id = "status"
+title = "AI workflow status"
+placement = "popup"
+width = "84%"
+height = "78%"
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" status --watch"]
+
+[[events]]
+on = "pane.agent_status_changed"
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" event"]
+
+[[events]]
+on = "pane.agent_detected"
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" event"]
+
+[[events]]
+on = "pane.exited"
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" event"]
+
+[[events]]
+on = "pane.closed"
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" event"]
+
+[[events]]
+on = "pane.moved"
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" event"]
+
+[[events]]
+on = "worktree.removed"
+command = ["bash", "-c", "exec python3 \"$HERDR_PLUGIN_ROOT/src/herdr_flow.py\" event"]
