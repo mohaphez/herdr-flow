@@ -85,7 +85,7 @@ Run CLI commands that inspect or control live sessions **inside a Herdr-managed 
 | `/ai-run <task-id>` / `/prompts:ai-run <task-id>` | Claude/OpenCode / Codex **original coordinator** | Start implementation after a plan-only handoff; a launcher must not claim another session. |
 | `herdr-flow defaults` | Shell, read-only | Show the global coordinator kind, model, and variant. |
 | `herdr-flow doctor` | Shell, read-only | Validate tools, installed model IDs, and private configuration. |
-| `herdr-flow create --title "<title>"` | Herdr pane, manual path | Create a task and empty handoff/brief; add `--plan-only` to leave implementation off. Explicit `--coordinator-*`, `--worker-*`, `--reviewer-*`, and `--fixer-*` override defaults for this task. |
+| `herdr-flow create --title "<title>"` | Herdr pane, manual path | Create a task and empty handoff/brief; add `--plan-only` to leave implementation off. Set `--branch-type refactor` (or another allowed type) to override inference; explicit agent flags override defaults. |
 | `herdr-flow start-coordinator --task <id>` | Herdr pane, after filling `brief.md` | Launch the recorded dedicated coordinator once; not needed for an attached, unpinned Claude coordinator. |
 | `herdr-flow run --task <id>` | **Recorded coordinator pane only** | Begin automatic worker → reviewer → repair → final-review handoffs after the handoff is ready. |
 | `herdr-flow status --task <id>` | Herdr pane | Inspect phase, agent/pane identity, review gates, instruction drift, and attention; add `--json` for structured output. |
@@ -94,6 +94,7 @@ Run CLI commands that inspect or control live sessions **inside a Herdr-managed 
 | `herdr-flow resume --task <id>` | Herdr pane, recovery | Reuse existing sessions; recover only genuinely missing worker/reviewer sessions. |
 | `herdr-flow advance --task <id>` | Herdr pane, exceptional reconciliation | Reconcile an already-written report without repeating an implementation prompt. |
 | `herdr-flow refresh-instructions --task <id> --yes` | Herdr pane, after review, agents idle | Refresh owned worktree instruction snapshots if main-checkout instructions changed. |
+| `herdr-flow reconcile-branch --task <id> --branch <name> --yes` | Herdr pane, after an unprovable rename in DONE | Explicitly acknowledge the *already checked-out* task branch after inspecting Git; changes only task metadata, never Git refs. |
 | `herdr-flow finalize --task <id>` | Herdr pane, **after human merge** | Remove only a verified merged, clean, owned task worktree; keep branch and task records. |
 
 Agents normally call `herdr-flow finish`, `review-result`, and `final-result` themselves after writing evidence-backed reports. Manual `implement`, `review`, `fix`, and `configure-agent` are available for recovery or pre-session role selection. Never use `resend --yes` before `inspect`, or use any command to bypass a blocked agent.
@@ -119,6 +120,12 @@ herdr-flow status --task task-001
 You can pin roles on `create` using `--coordinator-kind`, `--coordinator-model`, `--coordinator-variant`, `--worker-*`, `--reviewer-*`, `--fixer-*`, and `--escalation-*`; omit coordinator flags to use the global default. Task selections are frozen in `state.json` and do not change when defaults change. The global config is not overridden by a project's `.ai/workflow/config.json` snapshot. Worker/reviewer/fixer sessions retain their model and identity once launched.
 
 Task state lives in the source checkout under `.ai/workflow/<task-id>/`; the task worktree has an ignored marker and symlink to it. In the source checkout, the plugin snapshots **only** ignored root `AGENTS.md`/`CLAUDE.md` into the worktree when absent; it does not copy `.env`, `.agents/`, `.claude/`, or arbitrary ignored files. `.herdr-flow-context.md` warns agents that commands and Docker/Compose mounts from the main checkout may not work safely in an isolated worktree. Source drift or modified snapshots require inspection and, for changes to the source files, an explicit `herdr-flow refresh-instructions --task <id> --yes` from an idle Herdr task.
+
+### Standard branch names
+
+New tasks use `feat/<slug>`, `fix/<slug>`, `refactor/<slug>`, `docs/<slug>`, `test/<slug>`, or `chore/<slug>` based on keywords in the **task title**. For example, **“Optimize FormBuilder queries and caching”** produces `refactor/optimize-formbuilder-queries-and-caching`. A neutral title defaults to `feat/`. In command-driven planning, choose a meaningful action verb in the title; if inference is wrong, specify `--branch-type <type>` when creating the task. Herdr Flow adds `-task-<id>` only when the short name collides with a local/remote branch or another task record. It never renames an existing branch just because the naming policy changed.
+
+If you rename a task branch in Git after creation, `finalize` accepts the new checked-out name **only** when the original branch no longer exists and Git's reflog proves the exact rename. It records the change in `project.branch_history` after all merge, cleanliness, and ownership checks pass. If proof is missing or ambiguous, it refuses cleanup with an actionable message: inspect the worktree and, from Herdr, run `herdr-flow reconcile-branch --task <id> --branch <actual-checked-out-name> --yes`, then `finalize`. Reconciliation requires a DONE task and matching task ownership marker; it never renames Git refs or overrides a foreign worktree.
 
 ### Review, recovery, and cleanup
 

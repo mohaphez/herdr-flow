@@ -263,6 +263,7 @@ class WorkflowTests(unittest.TestCase):
     def test_harness_entry_points_exist_and_defaults_is_read_only(self):
         self.assertEqual("defaults", parse_args(["defaults"]).command)
         self.assertTrue(parse_args(["create", "--title", "Plan only", "--plan-only"]).plan_only)
+        self.assertEqual("refactor", parse_args(["create", "--title", "Optimize queries", "--branch-type", "refactor"]).branch_type)
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(0, main(["defaults"]))
@@ -466,9 +467,18 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("claude-test", self.fake.prompts[-1][0])
 
     def test_title_branch_is_readable_and_unique(self):
-        self.assertEqual("ai/acceptance-test-task-test-001", self.store.read()["project"]["branch"])
+        self.assertEqual("test/acceptance-test", self.store.read()["project"]["branch"])
         store = self.workflow.create("Acceptance test", "task-test-002")
-        self.assertEqual("ai/acceptance-test-task-test-002", store.read()["project"]["branch"])
+        self.assertEqual("test/acceptance-test-task-test-002", store.read()["project"]["branch"])
+        refactor = self.workflow.create("Optimize FormBuilder queries and caching", "task-optimize")
+        self.assertEqual("refactor/optimize-formbuilder-queries-and-caching", refactor.read()["project"]["branch"])
+        fixed = self.workflow.create("Fix login error", "task-fix")
+        self.assertEqual("fix/fix-login-error", fixed.read()["project"]["branch"])
+        override = self.workflow.create("Optimize login", "task-feature", branch_type="feat")
+        self.assertEqual("feat/optimize-login", override.read()["project"]["branch"])
+        with self.assertRaisesRegex(FlowError, "Branch type"):
+            self.workflow.create("Bad type", "task-invalid", branch_type="ai")
+        self.assertFalse((self.workflow.workflow_root / "task-invalid").exists())
 
     def test_automatic_handoffs_from_reports_and_coordinator(self):
         state = self.workflow.run_task(self.store)
@@ -498,6 +508,74 @@ class WorkflowTests(unittest.TestCase):
         self.write_final("PASS")
         self.assertEqual("DONE", self.settle("coordinator")["phase"])
         self.assertEqual(1, self.fake.start_count["worker"])
+
+    def test_branch_conflicts_with_remote_and_namespace_are_guarded(self):
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True, capture_output=True, check=True).stdout.strip()
+        subprocess.run(["git", "update-ref", "refs/remotes/origin/feat/add-dashboard", head], cwd=self.repo, check=True)
+        task = self.workflow.create("Add dashboard", "task-dashboard")
+        self.assertEqual("feat/add-dashboard-task-dashboard", task.read()["project"]["branch"])
+        subprocess.run(["git", "update-ref", "refs/heads/docs", head], cwd=self.repo, check=True)
+        with self.assertRaisesRegex(FlowError, "namespace docs/"):
+            self.workflow.create("Document dashboard", "task-docs")
+
+    def _prepare_merged_renamed_worktree(self):
+        path = self.root / "renamed-task-worktree"
+        original = self.store.read()["project"]["branch"]
+        renamed = "refactor/acceptance-test"
+        subprocess.run(["git", "worktree", "add", "-q", "-b", original, str(path), "HEAD"], cwd=self.repo, check=True)
+        with self.store.locked() as state:
+            state["phase"] = "DONE"
+            state["review"]["status"] = "PASS"
+            state["final_review"]["status"] = "PASS"
+            state["project"]["worktree_path"] = str(path)
+            state["project"]["workspace_id"] = self.fake.workspace
+            self.workflow._link_task_marker(path, state)
+        (path / "README.md").write_text("implemented\n")
+        subprocess.run(["git", "add", "README.md"], cwd=path, check=True)
+        subprocess.run(["git", "commit", "-qm", "implementation"], cwd=path, check=True)
+        subprocess.run(["git", "branch", "-m", renamed], cwd=path, check=True)
+        subprocess.run(["git", "merge", "-q", "--ff-only", renamed], cwd=self.repo, check=True)
+        self.fake.panes = lambda: []
+        self.fake.remove_worktree = lambda workspace: subprocess.run(["git", "worktree", "remove", str(path)], cwd=self.repo, check=True)
+        return path, original, renamed
+
+    def test_finalize_recognizes_verified_git_branch_rename(self):
+        path, original, renamed = self._prepare_merged_renamed_worktree()
+        state = self.workflow.finalize(self.store)
+        self.assertTrue(state["cleanup"]["completed"])
+        self.assertFalse(path.exists())
+        self.assertEqual(renamed, state["project"]["branch"])
+        self.assertEqual({"from": original, "to": renamed, "reason": "git_reflog"},
+                         {key: state["project"]["branch_history"][0][key] for key in ("from", "to", "reason")})
+
+    def test_ambiguous_rename_requires_explicit_confirmation_and_ownership(self):
+        path, original, renamed = self._prepare_merged_renamed_worktree()
+        subprocess.run(["git", "branch", original, "HEAD"], cwd=self.repo, check=True)
+        with self.assertRaisesRegex(FlowError, "still exists"):
+            self.workflow.finalize(self.store)
+        with self.assertRaisesRegex(FlowError, "requires --yes"):
+            self.workflow.reconcile_branch(self.store, renamed)
+        with self.assertRaisesRegex(FlowError, "not the requested"):
+            self.workflow.reconcile_branch(self.store, "feat/other", yes=True)
+        marker = path / ".herdr-flow-task.json"
+        data = json.loads(marker.read_text())
+        data["task_id"] = "task-other"
+        marker.write_text(json.dumps(data))
+        with self.assertRaisesRegex(FlowError, "ownership"):
+            self.workflow.reconcile_branch(self.store, renamed, yes=True)
+        data["task_id"] = self.store.task_id
+        marker.write_text(json.dumps(data))
+        other = self.workflow.create("Another task", "task-branch-owner")
+        with other.locked() as owned:
+            owned["project"]["branch"] = renamed
+        with self.assertRaisesRegex(FlowError, "another Herdr Flow task"):
+            self.workflow.reconcile_branch(self.store, renamed, yes=True)
+        with other.locked() as owned:
+            owned["project"]["branch"] = "feat/another-task"
+        reconciled = self.workflow.reconcile_branch(self.store, renamed, yes=True)
+        self.assertEqual(renamed, reconciled["project"]["branch"])
+        self.assertEqual("user_confirmed", reconciled["project"]["branch_history"][0]["reason"])
+        self.assertTrue(self.workflow.finalize(self.store)["cleanup"]["completed"])
 
     def test_finalize_rejects_unmerged_or_dirty_and_removes_clean_merged_worktree(self):
         path = self.root / "task-checkout"

@@ -37,7 +37,6 @@
     }
   },
   "git": {
-    "branch_prefix": "ai/",
     "base_ref": "HEAD",
     "require_human_merge": true
   },

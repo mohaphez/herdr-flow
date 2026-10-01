@@ -33,6 +33,7 @@ AGENT_KINDS = {"opencode", "codex"}
 VARIANTS = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 SESSION_ROLES = ("worker", "fixer", "escalation_fixer", "reviewer")
 CONFIGURABLE_ROLES = ("coordinator", "worker", "fixer", "escalation_fixer", "reviewer")
+BRANCH_TYPES = ("feat", "fix", "refactor", "docs", "test", "chore")
 INSTRUCTION_FILES = ("AGENTS.md", "CLAUDE.md")
 CONTEXT_FILE = ".herdr-flow-context.md"
 MAX_INSTRUCTION_BYTES = 256 * 1024
@@ -571,6 +572,7 @@ class Workflow:
         escalate_after: int | None = None,
         disable_escalation: bool = False,
         plan_only: bool = False,
+        branch_type: str | None = None,
     ) -> TaskStore:
         self.init()
         worker_config = self._selection(self.config["agents"]["worker"], worker)
@@ -608,10 +610,10 @@ class Workflow:
             store = TaskStore(self.workflow_root, task_id)
             if store.root.exists():
                 raise FlowError(f"Task already exists: {task_id}")
+            branch = self._task_branch(title, task_id, branch_type)
             store.root.mkdir(parents=True)
             for name, content in TEMPLATES.items():
                 atomic_write(store.root / name, content, 0o600)
-            branch = self._task_branch(title, task_id)
             worker_name = self._agent_name("worker", task_id)
             fixer_name = self._agent_name("fixer", task_id)
             escalation_name = self._agent_name("escalator", task_id)
@@ -1149,6 +1151,49 @@ class Workflow:
                 latest["automation"]["attention"] = str(exc)
             return store.read()
 
+    def _worktree_branch(self, path: Path) -> str:
+        listed = run(["git", "worktree", "list", "--porcelain"], cwd=self.source_root).stdout
+        stanza = next((item for item in listed.split("\n\n") if item.startswith(f"worktree {path}\n")), None)
+        branches = [line.removeprefix("branch refs/heads/") for line in stanza.splitlines()
+                    if line.startswith("branch refs/heads/")] if stanza else []
+        if len(branches) != 1:
+            raise FlowError(f"Task worktree {path} is absent or detached; inspect before cleanup")
+        return branches[0]
+
+    def _check_other_task_branch(self, task_id: str, branch: str) -> None:
+        for state_path in self.workflow_root.glob("task-*/state.json"):
+            if state_path.parent.name != task_id and read_json(state_path).get("project", {}).get("branch") == branch:
+                raise FlowError(f"Branch {branch} is recorded by another Herdr Flow task; refusing to claim it")
+
+    def reconcile_branch(self, store: TaskStore, branch: str, *, yes: bool = False) -> dict[str, Any]:
+        """Explicitly record a checked-out task branch rename; never rename Git refs."""
+        HerdrAdapter.require_context()
+        if not yes:
+            raise FlowError("Branch reconciliation requires --yes after inspecting the worktree and its Git history")
+        with store.locked() as state:
+            if state["phase"] != "DONE" or state.get("cleanup", {}).get("completed"):
+                raise FlowError("Only an unfinished cleanup in DONE can reconcile a branch")
+            path = state["project"].get("worktree_path")
+            if not path or not Path(path).is_dir():
+                raise FlowError("Recorded task worktree is missing; cannot reconcile a branch")
+            path = Path(path).resolve()
+            marker = path / ".herdr-flow-task.json"
+            if not marker.is_file():
+                raise FlowError("Task worktree has no ownership marker; refusing branch reconciliation")
+            owner = read_json(marker)
+            if owner.get("task_id") != store.task_id or owner.get("source_root") != str(self.source_root):
+                raise FlowError("Task worktree ownership marker does not match; refusing branch reconciliation")
+            actual = self._worktree_branch(path)
+            if actual != branch or not self._branch_exists(branch):
+                raise FlowError(f"Git worktree is on {actual}, not the requested existing branch {branch}")
+            old = state["project"]["branch"]
+            if old != branch:
+                self._check_other_task_branch(store.task_id, branch)
+                state["project"].setdefault("branch_history", []).append({"from": old, "to": branch, "at": utc_now(), "reason": "user_confirmed"})
+                state["project"]["branch"] = branch
+                store.event(state, "BRANCH_RECONCILED", "coordinator", f"User confirmed branch rename: {old} -> {branch}")
+            return state
+
     def finalize(self, store: TaskStore) -> dict[str, Any]:
         """Close only an owned, idle, clean worktree whose branch reached source HEAD."""
         HerdrAdapter.require_context()
@@ -1162,11 +1207,23 @@ class Workflow:
         if not workspace or not path:
             raise FlowError("Task has no recorded worktree workspace")
         path = Path(path).resolve()
-        listed = run(["git", "worktree", "list", "--porcelain"], cwd=self.source_root).stdout
         branch = project["branch"]
-        stanza = next((item for item in listed.split("\n\n") if item.startswith(f"worktree {path}\n")), None)
-        if not stanza or f"branch refs/heads/{branch}" not in stanza.splitlines():
-            raise FlowError("Recorded task worktree/branch does not match Git's registered worktree; inspect manually")
+        actual = self._worktree_branch(path)
+        if actual != branch:
+            marker = path / ".herdr-flow-task.json"
+            if not marker.is_file():
+                raise FlowError("Task worktree has no ownership marker; refusing automatic branch reconciliation")
+            owner = read_json(marker)
+            if owner.get("task_id") != store.task_id or owner.get("source_root") != str(self.source_root):
+                raise FlowError("Task worktree ownership marker does not match; refusing automatic branch reconciliation")
+            self._check_other_task_branch(store.task_id, actual)
+            if self._branch_exists(branch):
+                raise FlowError(f"Recorded branch {branch} still exists but worktree uses {actual}; inspect and explicitly reconcile")
+            log = run(["git", "reflog", "show", "--format=%gs", f"refs/heads/{actual}"], cwd=self.source_root, check=False)
+            proof = f"Branch: renamed refs/heads/{branch} to refs/heads/{actual}"
+            if log.returncode != 0 or proof not in log.stdout.splitlines():
+                raise FlowError(f"Cannot verify rename {branch} -> {actual}; from a Herdr pane inspect Git history, then run `herdr-flow reconcile-branch --task {store.task_id} --branch {actual} --yes`")
+            branch = actual
         source_branch = run(["git", "branch", "--show-current"], cwd=self.source_root).stdout.strip()
         if not source_branch or source_branch == branch:
             raise FlowError("Source checkout must be on its integration branch for merge verification")
@@ -1199,6 +1256,11 @@ class Workflow:
         # Herdr owns the panes and agent processes; never signal them from outside Herdr.
         self.herdr.remove_worktree(workspace)
         with store.locked() as locked:
+            if branch != locked["project"]["branch"]:
+                previous = locked["project"]["branch"]
+                locked["project"].setdefault("branch_history", []).append({"from": previous, "to": branch, "at": utc_now(), "reason": "git_reflog"})
+                locked["project"]["branch"] = branch
+                store.event(locked, "BRANCH_RECONCILED", "coordinator", f"Verified Git branch rename: {previous} -> {branch}")
             locked["cleanup"] = {"completed": True, "at": utc_now(), "workspace": workspace, "path": str(path)}
             store.event(locked, "WORKTREE_CLEANED", "coordinator", f"Merged clean worktree removed: {path}")
             self.registry.update(locked, store.state_path)
@@ -1784,9 +1846,38 @@ class Workflow:
         result = run(["git", "show-ref", "--verify", "--quiet", f"refs/heads/{branch}"], cwd=self.source_root, check=False)
         return result.returncode == 0
 
-    def _task_branch(self, title: str, task_id: str) -> str:
+    def _task_branch(self, title: str, task_id: str, branch_type: str | None = None) -> str:
+        if branch_type is not None and branch_type not in BRANCH_TYPES:
+            raise FlowError(f"Branch type must be one of: {', '.join(BRANCH_TYPES)}")
+        words = set(re.findall(r"[a-z0-9]+", title.lower()))
+        if branch_type is None:
+            if words & {"fix", "bug", "bugfix", "resolve", "repair", "hotfix"}:
+                branch_type = "fix"
+            elif words & {"refactor", "refactoring", "optimize", "optimise", "improve", "simplify", "cleanup"}:
+                branch_type = "refactor"
+            elif words & {"docs", "documentation", "document", "readme"}:
+                branch_type = "docs"
+            elif words & {"test", "tests", "testing", "coverage"}:
+                branch_type = "test"
+            elif words & {"chore", "ci", "build", "deps", "dependencies", "tooling", "release"}:
+                branch_type = "chore"
+            else:
+                branch_type = "feat"
         slug = re.sub(r"[^a-z0-9]+", "-", title.lower()).strip("-")[:48].strip("-") or "task"
-        return f"{self.config['git']['branch_prefix']}{slug}-{task_id}"
+        candidate = f"{branch_type}/{slug}"
+        existing = {item.get("project", {}).get("branch") for path in self.workflow_root.glob("task-*/state.json")
+                    if isinstance((item := read_json(path)), dict)}
+        refs = run(["git", "for-each-ref", "--format=%(refname)", "refs/heads", "refs/remotes"], cwd=self.source_root).stdout.splitlines()
+        if any(ref == f"refs/heads/{branch_type}" or
+               (ref.startswith("refs/remotes/") and ref.endswith(f"/{branch_type}")) for ref in refs):
+            raise FlowError(f"Branch namespace {branch_type}/ conflicts with an existing branch; choose another branch type")
+        if candidate in existing or any(ref == f"refs/heads/{candidate}" or
+                                        (ref.startswith("refs/remotes/") and ref.endswith(f"/{candidate}")) for ref in refs):
+            candidate = f"{candidate}-{task_id}"
+        if candidate in existing or any(ref == f"refs/heads/{candidate}" or
+                                        (ref.startswith("refs/remotes/") and ref.endswith(f"/{candidate}")) for ref in refs):
+            raise FlowError(f"Branch name already exists: {candidate}; choose another title or task ID")
+        return candidate
 
     @staticmethod
     def _task_number(task_id: str) -> int:
@@ -1983,6 +2074,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sub.add_parser("init")
     create = sub.add_parser("create")
     create.add_argument("--title", required=True)
+    create.add_argument("--branch-type", choices=BRANCH_TYPES, help="Override the inferred feat/fix/refactor/docs/test/chore branch prefix")
     create.add_argument("--task")
     create.add_argument("--base")
     add_agent_selection_args(create, "coordinator")
@@ -1993,7 +2085,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     create.add_argument("--escalate-after", type=int)
     create.add_argument("--disable-escalation", action="store_true")
     create.add_argument("--plan-only", action="store_true", help="Ask a managed coordinator for a handoff without automatically starting implementation")
-    for name in ("start-coordinator", "run", "advance", "finalize", "implement", "fix", "review", "finish", "resume", "final-start", "status", "refresh-instructions"):
+    for name in ("start-coordinator", "run", "advance", "finalize", "implement", "fix", "review", "finish", "resume", "final-start", "status", "refresh-instructions", "reconcile-branch"):
         item = sub.add_parser(name)
         item.add_argument("--task")
         if name in {"implement", "fix", "review"}:
@@ -2002,6 +2094,9 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             add_agent_selection_args(item, "escalation")
             item.add_argument("--escalate-after", type=int)
             item.add_argument("--disable-escalation", action="store_true")
+        if name == "reconcile-branch":
+            item.add_argument("--branch", required=True)
+            item.add_argument("--yes", action="store_true")
         if name == "refresh-instructions":
             item.add_argument("--yes", action="store_true")
         if name == "status":
@@ -2105,6 +2200,7 @@ def main(argv: list[str] | None = None) -> int:
             escalate_after=args.escalate_after,
             disable_escalation=args.disable_escalation,
             plan_only=args.plan_only,
+            branch_type=args.branch_type,
         )
         print(json.dumps({"task_id": store.task_id, "root": str(store.root), "brief": str(store.root / "brief.md"), "handoff": str(store.root / "handoff.md"), "coordinator": store.read()["coordinator"]["kind"]}, indent=2))
         return 0
@@ -2118,6 +2214,8 @@ def main(argv: list[str] | None = None) -> int:
         state = workflow.advance(store)
     elif args.command == "finalize":
         state = workflow.finalize(store)
+    elif args.command == "reconcile-branch":
+        state = workflow.reconcile_branch(store, args.branch, yes=args.yes)
     elif args.command == "refresh-instructions":
         state = workflow.refresh_instructions(store, yes=args.yes)
     elif args.command == "configure-agent":
