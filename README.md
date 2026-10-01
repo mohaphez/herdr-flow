@@ -4,6 +4,37 @@ File-backed, persistent multi-agent development workflow for [Herdr](https://her
 
 > **Status:** Automated state-machine tests pass; the full live three-harness acceptance scenario in `ACCEPTANCE.md` remains to be performed inside Herdr. Do not assume race-free operation or unattended production readiness from unit tests alone.
 
+## Workflow at a glance
+
+```mermaid
+flowchart TD
+    A["Inside Herdr: /ai-plan or $herdr-flow-plan"] --> B["Task + original brief.md"]
+    B --> C["Selected coordinator: investigate + handoff.md"]
+    C -->|Plan only| P["Stop: await user approval to run"]
+    C -->|Start implementation| W["Persistent worker: implement + implementation.md"]
+    W --> R["Independent reviewer: review.md PASS / FAIL"]
+    R -->|FAIL| F["Repair: persistent worker or configured fixer"]
+    F --> R
+    R -->|PASS| G["Same coordinator: final-review.md PASS / FAIL"]
+    G -->|FAIL| F
+    G -->|PASS| D["DONE: no automatic commit or merge"]
+    D --> H["Human commits and merges task branch"]
+    H -->|Verified merge + clean, owned worktree| X["Guarded worktree cleanup / finalize"]
+    W -.->|Blocked or uncertain prompt| U["Wait: user inspects the same session"]
+    R -.->|Blocked or uncertain prompt| U
+    G -.->|Blocked or uncertain prompt| U
+```
+
+**Example — add OAuth login**
+
+1. From a Herdr-managed Claude or OpenCode pane, enter `/ai-plan Add OAuth login` (Codex: `$herdr-flow-plan Add OAuth login`). The launcher creates one task and saves the request in `brief.md`.
+2. The **globally selected coordinator** investigates, asks about unresolved decisions, and writes `handoff.md`. If another harness was selected, it works in its own pane. For a plan-only request, it stops here; otherwise it calls `herdr-flow run` once.
+3. A persistent worker implements in the task worktree. An independent reviewer checks the result; FAIL routes findings to the worker or configured fixer, followed by another review.
+4. After reviewer PASS, the **original coordinator** performs final review. A final FAIL enters the repair/review loop; PASS moves the task to DONE.
+5. **You** commit and merge. Only a verified merge and clean, owned worktree permit guarded cleanup. The branch and task records remain.
+
+A blocked agent stays in its existing pane. An uncertain prompt is **never** automatically resent.
+
 ## Requirements
 
 Linux, Python 3.10+ (tested with 3.14), Git, Herdr 0.9.1+, Claude Code, OpenCode, Codex, and `jq`. Model IDs must be available in your installed OpenCode/Codex catalogs. The plugin uses `hessam.herdr-flow` as its stable Herdr identifier; it does not contain credentials.
@@ -43,6 +74,30 @@ Herdr Flow keeps a **private** runtime config at `~/.config/herdr/plugins/config
 
 This install intentionally refuses to replace another registered plugin or command/skill symlink. From within Herdr, first confirm no live task depends on the old installation, retain its task state and worktrees, and explicitly unlink the old plugin. Copy any private config to a private file outside the old checkout, then remove **only symlinks verified to point to the old plugin** before running the standalone installer. A repository clone or external terminal must not silently take over existing panes, sessions, or workspaces.
 
+## Command reference
+
+Run CLI commands that inspect or control live sessions **inside a Herdr-managed pane**; `defaults` and `doctor` are read-only. The `--task` value is the ID returned by `create` (for example `task-001`). Slash commands are entered in the named agent, not in a shell.
+
+| Command | Where / when | What it does |
+| --- | --- | --- |
+| `/ai-plan <request>` | Claude or OpenCode agent | Create one task, record the original request, and plan with the global coordinator. |
+| `$herdr-flow-plan <request>` | Codex agent | Preferred Codex planning skill; `/prompts:ai-plan <request>` is a deprecated compatibility shortcut. |
+| `/ai-run <task-id>` / `/prompts:ai-run <task-id>` | Claude/OpenCode / Codex **original coordinator** | Start implementation after a plan-only handoff; a launcher must not claim another session. |
+| `herdr-flow defaults` | Shell, read-only | Show the global coordinator kind, model, and variant. |
+| `herdr-flow doctor` | Shell, read-only | Validate tools, installed model IDs, and private configuration. |
+| `herdr-flow create --title "<title>"` | Herdr pane, manual path | Create a task and empty handoff/brief; add `--plan-only` to leave implementation off. Explicit `--coordinator-*`, `--worker-*`, `--reviewer-*`, and `--fixer-*` override defaults for this task. |
+| `herdr-flow start-coordinator --task <id>` | Herdr pane, after filling `brief.md` | Launch the recorded dedicated coordinator once; not needed for an attached, unpinned Claude coordinator. |
+| `herdr-flow run --task <id>` | **Recorded coordinator pane only** | Begin automatic worker → reviewer → repair → final-review handoffs after the handoff is ready. |
+| `herdr-flow status --task <id>` | Herdr pane | Inspect phase, agent/pane identity, review gates, instruction drift, and attention; add `--json` for structured output. |
+| `herdr-flow focus --task <id> --role <role>` | Herdr pane | Focus the existing coordinator, worker, reviewer, or fixer session. |
+| `herdr-flow inspect --task <id> --role <role>` | Herdr pane | Read the recorded live agent before considering recovery or a deliberate resend. |
+| `herdr-flow resume --task <id>` | Herdr pane, recovery | Reuse existing sessions; recover only genuinely missing worker/reviewer sessions. |
+| `herdr-flow advance --task <id>` | Herdr pane, exceptional reconciliation | Reconcile an already-written report without repeating an implementation prompt. |
+| `herdr-flow refresh-instructions --task <id> --yes` | Herdr pane, after review, agents idle | Refresh owned worktree instruction snapshots if main-checkout instructions changed. |
+| `herdr-flow finalize --task <id>` | Herdr pane, **after human merge** | Remove only a verified merged, clean, owned task worktree; keep branch and task records. |
+
+Agents normally call `herdr-flow finish`, `review-result`, and `final-result` themselves after writing evidence-backed reports. Manual `implement`, `review`, `fix`, and `configure-agent` are available for recovery or pre-session role selection. Never use `resend --yes` before `inspect`, or use any command to bypass a blocked agent.
+
 ## Start a task
 
 Inside a Herdr-managed project pane:
@@ -55,7 +110,7 @@ The launcher creates one task, stores the original safe request in `brief.md`, a
 Manual CLI path:
 
 ```bash
-herdr-flow create --title "Add OAuth login" [--plan-only]
+herdr-flow create --title "Add OAuth login"
 $EDITOR .ai/workflow/task-001/brief.md  # Replace the placeholder with a non-secret request.
 herdr-flow start-coordinator --task task-001  # From inside Herdr; required for managed coordinators.
 herdr-flow status --task task-001
