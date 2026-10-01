@@ -90,8 +90,12 @@ class FakeHerdr:
 
     def prompt(self, target, text):
         self.prompts.append((target, text))
-        agent = self.agents_by_name[target]
+        agent = self.agent(target)
+        if not agent:
+            raise AssertionError(f"Cannot prompt absent fake agent {target}")
         agent["agent_status"] = "working"
+        original = next(item for item in self.agents_by_name.values() if item["pane_id"] == agent["pane_id"])
+        original["agent_status"] = "working"
         return dict(agent)
 
     def workspaces(self):
@@ -107,7 +111,7 @@ class FakeHerdr:
         return f"terminal output for {target}"
 
     def focus(self, target):
-        return dict(self.agents_by_name[target])
+        return self.agent(target)
 
 
 class WorkflowTests(unittest.TestCase):
@@ -464,7 +468,74 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("become idle", state["automation"]["attention"])
         self.assertNotEqual("claude-test", self.fake.prompts[-1][0])
         self.settle("coordinator")
-        self.assertEqual("claude-test", self.fake.prompts[-1][0])
+        self.assertEqual("w-coordinator:p1", self.fake.prompts[-1][0])
+
+    def _ready_for_final_review(self):
+        self.workflow.run_task(self.store)
+        report = self.store.root / "implementation.md"
+        report.write_text(report.read_text().replace("PENDING", "READY", 1))
+        self.settle("worker")
+        self.write_review("PASS")
+        self.workflow.review_result(self.store, "PASS")
+        self.assertEqual("FINAL_REVIEW", self.store.read()["phase"])
+
+    def test_attached_coordinator_without_name_receives_final_review_by_verified_pane(self):
+        self._ready_for_final_review()
+        live = self.fake.agents_by_name.pop("claude-test")
+        live.pop("name")
+        self.fake.agents_by_name["unnamed"] = live
+        self.assertTrue(self.workflow.status(self.store)["coordinator"]["live"])
+        self.assertIn("terminal output", self.workflow.inspect_agent(self.store, "coordinator"))
+        self.assertEqual("w-coordinator:p1", self.workflow.focus(self.store, "coordinator")["pane_id"])
+        state = self.workflow.advance(self.store)
+        self.assertEqual(1, state["final_review"]["attempt"])
+        self.assertIsNone(state["automation"]["attention"])
+        self.assertEqual("w-coordinator:p1", self.fake.prompts[-1][0])
+        count = len(self.fake.prompts)
+        self.workflow.advance(self.store)
+        self.assertEqual(count, len(self.fake.prompts))
+
+    def test_attached_coordinator_renamed_in_same_session_still_receives_final_review(self):
+        self._ready_for_final_review()
+        live = self.fake.agents_by_name.pop("claude-test")
+        live["name"] = "claude"
+        self.fake.agents_by_name["claude"] = live
+        state = self.workflow.advance(self.store)
+        self.assertEqual(1, state["final_review"]["attempt"])
+        self.assertEqual("w-coordinator:p1", self.fake.prompts[-1][0])
+
+    def test_attached_coordinator_session_change_blocks_final_review(self):
+        self._ready_for_final_review()
+        live = self.fake.agents_by_name["claude-test"]
+        live["agent_session"] = {"kind": "id", "value": "different-session"}
+        self.assertFalse(self.workflow.status(self.store)["coordinator"]["live"])
+        with self.assertRaisesRegex(FlowError, "Original coordinator pane or session changed"):
+            self.workflow.inspect_agent(self.store, "coordinator")
+        state = self.workflow.advance(self.store)
+        self.assertIn("session cannot be verified", state["automation"]["attention"])
+        self.assertEqual(0, state["final_review"]["attempt"])
+        self.assertEqual(0, len([p for _, p in self.fake.prompts if "Act as final release gate" in p]))
+        with self.assertRaisesRegex(FlowError, "refusing to focus"):
+            self.workflow.focus(self.store, "coordinator")
+        with self.assertRaisesRegex(FlowError, "Original attached coordinator"):
+            self.workflow.run_task(self.store)
+
+    def test_coordinator_prompt_identity_change_is_uncertain_not_reassigned(self):
+        self._ready_for_final_review()
+        original = self.store.read()["coordinator"]["session"]
+        prompt = self.fake.prompt
+        def changed(target, text):
+            reply = prompt(target, text)
+            reply["agent_session"] = {"kind": "id", "value": "changed-after-prompt"}
+            return reply
+        self.fake.prompt = changed
+        state = self.workflow.advance(self.store)
+        self.assertIn("identity changed during prompt submission", state["automation"]["attention"])
+        self.assertEqual("uncertain", state["prompts"]["coordinator"]["status"])
+        self.assertEqual(original, state["coordinator"]["session"])
+        count = len(self.fake.prompts)
+        self.workflow.advance(self.store)
+        self.assertEqual(count, len(self.fake.prompts))
 
     def test_title_branch_is_readable_and_unique(self):
         self.assertEqual("test/acceptance-test", self.store.read()["project"]["branch"])
@@ -501,7 +572,7 @@ class WorkflowTests(unittest.TestCase):
         passed = self.settle("reviewer")
         self.assertEqual("FINAL_REVIEW", passed["phase"])
         self.assertEqual(1, self.fake.start_count["reviewer"])
-        self.assertEqual("claude-test", self.fake.prompts[-1][0])
+        self.assertEqual("w-coordinator:p1", self.fake.prompts[-1][0])
         sent = len(self.fake.prompts)
         self.settle("reviewer")
         self.assertEqual(sent, len(self.fake.prompts))

@@ -1022,6 +1022,8 @@ class Workflow:
                     raise FlowError("Run from this task's original managed coordinator session")
             elif previous.get("model") or previous.get("variant") or previous["kind"] != "claude":
                 raise FlowError("Pinned-model or non-Claude coordinators require `herdr-flow start-coordinator --task ...` first")
+            elif previous.get("pane") and (pane != previous["pane"] or not previous.get("session") or live.get("agent_session") != previous["session"]):
+                raise FlowError("Original attached coordinator pane or session changed; inspect before continuing")
             if state.get("automation", {}).get("enabled") and previous.get("pane") != pane:
                 raise FlowError("Another coordinator pane already owns this task; stop before changing ownership")
             already_running = bool(state.get("automation", {}).get("enabled"))
@@ -1044,12 +1046,16 @@ class Workflow:
             if prior and prior.get("status") in {"sending", "submitted", "uncertain"}:
                 return state
             record = state["coordinator"]
-            target = record.get("name") or record.get("pane")
+            target = record.get("name") if record.get("managed") else record.get("pane")
             live = self._live_agent(target) if target else None
-            if not live or live.get("pane_id") != record.get("pane") or (
-                record.get("session") and live.get("agent_session") != record["session"]
-            ):
-                state["automation"]["attention"] = "Coordinator session missing or changed; final review needs its original live coordinator"
+            if not live:
+                state["automation"]["attention"] = "Original coordinator agent is missing; inspect its recorded pane before final review"
+                return state
+            if live.get("pane_id") != record.get("pane") or live.get("agent") != record["kind"]:
+                state["automation"]["attention"] = "Original coordinator pane or agent kind changed; inspect before final review"
+                return state
+            if not record.get("session") or live.get("agent_session") != record["session"]:
+                state["automation"]["attention"] = "Original coordinator session cannot be verified; inspect before final review"
                 return state
             status = record.get("status") if settled_role == "coordinator" else live.get("agent_status")
             if status not in {"idle", "done"}:
@@ -1072,7 +1078,10 @@ class Workflow:
                 "The controller advances automatically; an idle event also reconciles the report if needed. Do not ask the user to run a phase command. "
                 "Do not commit, merge, or remove the worktree."
             )
-            self._submit_once(store, state, "coordinator", prompt)
+            # Attached agents can lose their display name while keeping the same pane and native session.
+            # Send by pane only after verifying both; managed coordinators retain their owned name.
+            prompt_target = record["name"] if record.get("managed") and live.get("name") == record.get("name") else record["pane"]
+            self._submit_once(store, state, "coordinator", prompt, target=prompt_target)
             state["automation"]["attention"] = None
             self.registry.update(state, store.state_path)
             return state
@@ -1304,11 +1313,15 @@ class Workflow:
         with store.locked() as state:
             if not state.get(role):
                 raise FlowError(f"No {role} session is configured for this task")
-            name = state[role]["name"]
-            agent = self.herdr.agent(name)
+            record = state[role]
+            target = record.get("pane") if role == "coordinator" and not record.get("managed") else record["name"]
+            agent = self.herdr.agent(target) if target else None
             if not agent:
                 raise FlowError(f"{role} session is not live")
-            output = self.herdr.read_agent(name)
+            if role == "coordinator" and (agent.get("pane_id") != record.get("pane") or agent.get("agent") != record["kind"] or
+                                          not record.get("session") or agent.get("agent_session") != record["session"]):
+                raise FlowError("Original coordinator pane or session changed; refusing to inspect a different agent")
+            output = self.herdr.read_agent(target)
             prompt = state["prompts"].get(role)
             if prompt:
                 prompt["inspected_at"] = utc_now()
@@ -1328,6 +1341,12 @@ class Workflow:
             if record.get("status") not in {"uncertain", "submitted"}:
                 raise FlowError("There is no uncertain/submitted prompt to resend")
             prompt = record["text"]
+            if role == "coordinator":
+                owner = state[role]
+                destination = owner.get("pane") if not owner.get("managed") else owner.get("name")
+                live = self._live_agent(destination) if destination else None
+                if not live or live.get("pane_id") != owner.get("pane") or live.get("agent") != owner["kind"] or not owner.get("session") or live.get("agent_session") != owner["session"]:
+                    raise FlowError("Original coordinator session cannot be verified; refusing resend")
             state["prompts"][role] = None
             self._submit_once(store, state, role, prompt, force_resend=True)
             return state
@@ -1339,10 +1358,15 @@ class Workflow:
             raise FlowError(f"Role must be one of: coordinator, {', '.join(SESSION_ROLES)}")
         if not state.get(role):
             raise FlowError(f"No {role} session is configured for this task")
-        name = state[role]["name"]
-        if not name:
+        record = state[role]
+        target = record.get("pane") if role == "coordinator" and not record.get("managed") else record.get("name")
+        if not target:
             raise FlowError(f"No {role} session is recorded")
-        return self.herdr.focus(name)
+        if role == "coordinator":
+            live = self._live_agent(target)
+            if not live or live.get("pane_id") != record.get("pane") or live.get("agent") != record["kind"] or not record.get("session") or live.get("agent_session") != record["session"]:
+                raise FlowError("Original coordinator pane or session changed; refusing to focus a different agent")
+        return self.herdr.focus(target)
 
     def refresh_instructions(self, store: TaskStore, *, yes: bool) -> dict[str, Any]:
         HerdrAdapter.require_context()
@@ -1413,7 +1437,11 @@ class Workflow:
                 record = state.get(role)
                 if not record:
                     continue
-                agent = self._live_agent(record.get("name"))
+                target = record.get("pane") if role == "coordinator" and not record.get("managed") else record.get("name")
+                agent = self._live_agent(target)
+                if role == "coordinator" and agent:
+                    agent = agent if (agent.get("pane_id") == record.get("pane") and agent.get("agent") == record["kind"]
+                                      and record.get("session") and agent.get("agent_session") == record["session"]) else None
                 record["live"] = bool(agent)
                 if agent:
                     record["live_status"] = agent.get("agent_status")
@@ -1717,7 +1745,12 @@ class Workflow:
     def _live_agent(self, name: str | None) -> dict[str, Any] | None:
         return self.herdr.agent(name) if name else None
 
-    def _submit_once(self, store: TaskStore, state: dict[str, Any], role: str, prompt: str, *, force_resend: bool = False) -> None:
+    def _submit_once(self, store: TaskStore, state: dict[str, Any], role: str, prompt: str, *, force_resend: bool = False, target: str | None = None) -> None:
+        if role == "coordinator" and not state[role].get("managed"):
+            target = state[role].get("pane")
+            live = self._live_agent(target) if target else None
+            if not live or live.get("pane_id") != target or live.get("agent") != state[role]["kind"] or not state[role].get("session") or live.get("agent_session") != state[role]["session"]:
+                raise FlowError("Original attached coordinator session cannot be verified; refusing prompt")
         digest = hashlib.sha256(prompt.encode()).hexdigest()
         existing = state["prompts"].get(role)
         if existing and existing.get("sha256") == digest and existing.get("status") in {"sending", "submitted", "uncertain"} and not force_resend:
@@ -1736,7 +1769,7 @@ class Workflow:
         state["prompts"][role] = record
         write_json(store.state_path, state)
         try:
-            agent = self.herdr.prompt(state[role]["name"], prompt)
+            agent = self.herdr.prompt(target or state[role]["name"], prompt)
         except HerdrError as exc:
             record["status"] = "not_sent" if exc.code == "agent_blocked" else "uncertain"
             record["error"] = {"code": exc.code, "message": exc.message}
@@ -1749,6 +1782,12 @@ class Workflow:
                 state["phase"] = "WAITING_FOR_USER"
             write_json(store.state_path, state)
             raise
+        if role == "coordinator" and (agent.get("pane_id") != state[role].get("pane") or
+                                      agent.get("agent_session") != state[role].get("session")):
+            record["status"] = "uncertain"
+            record["error"] = {"code": "coordinator_identity_changed", "message": "Prompt target changed during submission; inspect before any retry"}
+            write_json(store.state_path, state)
+            raise FlowError("Coordinator identity changed during prompt submission; inspect the pane before any retry")
         record["status"] = "submitted"
         record["submitted_at"] = utc_now()
         self._sync_agent(state[role], agent)

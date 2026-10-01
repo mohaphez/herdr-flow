@@ -2,7 +2,7 @@
 
 File-backed, persistent multi-agent development workflow for [Herdr](https://herdr.dev). A Claude Code, Codex, or OpenCode coordinator plans a task and performs its final release review. Independent OpenCode/Codex sessions implement, review, and repair in a task-specific Git worktree. **No automatic commit or merge.** Worktree cleanup requires a verified merge, a clean checkout, and ownership checks.
 
-> **v0.8.0 prerelease:** Automated state-machine tests pass; the full live three-harness acceptance scenario in `ACCEPTANCE.md` remains to be performed inside Herdr. The marketplace is an **unreviewed community index**, not a security or quality endorsement. Do not assume race-free operation or unattended production readiness from unit tests alone.
+> **Prerelease:** The latest tagged prerelease is v0.8.0; `main` contains an unreleased fix for attached coordinator names. Automated state-machine tests pass; the full live three-harness acceptance scenario in `ACCEPTANCE.md` remains to be performed inside Herdr. The marketplace is an **unreviewed community index**, not a security or quality endorsement. Do not assume race-free operation or unattended production readiness from unit tests alone.
 
 ## Workflow at a glance
 
@@ -33,7 +33,7 @@ flowchart TD
 4. After reviewer PASS, the **original coordinator** performs final review. A final FAIL enters the repair/review loop; PASS moves the task to DONE.
 5. **You** commit and merge. Only a verified merge and clean, owned worktree permit guarded cleanup. The branch and task records remain.
 
-A blocked agent stays in its existing pane. An uncertain prompt is **never** automatically resent.
+A blocked agent stays in its existing pane. An uncertain prompt is **never** automatically resent. For an externally attached Claude coordinator, final review targets the recorded pane only after matching its recorded native session and agent kind; a lost or changed display name alone does not transfer ownership. A changed session stops for inspection.
 
 ## Requirements
 

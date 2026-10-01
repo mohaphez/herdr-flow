@@ -1,6 +1,6 @@
 id = "hessam.herdr-flow"
 name = "Herdr Flow"
-version = "0.8.0"
+version = "0.8.1"
 min_herdr_version = "0.9.1"
 description = "Persistent task-owned Claude, Codex, or OpenCode coordination with independent implementation, review, and repair roles."
 platforms = ["linux"]
