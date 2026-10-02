@@ -476,8 +476,17 @@ class HerdrAdapter:
             raise
 
     def read_agent(self, target: str, lines: int = 100) -> str:
-        payload = self.call(["agent", "read", target, "--source", "recent-unwrapped", "--lines", str(lines)])
-        return str(payload["result"]["read"]["text"])
+        # Unlike agent.get, Herdr's agent.read writes terminal text directly to stdout.
+        self.require_context()
+        args = ["agent", "read", target, "--source", "recent-unwrapped", "--lines", str(lines)]
+        result = subprocess.run([self.binary, *args], text=True, capture_output=True)
+        if result.returncode != 0:
+            payload = self._payload(result.stderr) or self._payload(result.stdout)
+            error = (payload or {}).get("error", {})
+            code = str(error.get("code") or f"herdr_exit_{result.returncode}")
+            message = str(error.get("message") or result.stderr.strip() or result.stdout.strip())
+            raise HerdrError(code, message, payload)
+        return result.stdout
 
     def create_worktree(self, source: Path, branch: str, base: str, label: str) -> dict[str, Any]:
         return self.call([
@@ -728,6 +737,8 @@ class Workflow:
             current = {key: record.get(key) for key in ("kind", "model", "variant")}
             if proposed == current:
                 return state
+            if role == "escalation_fixer" and not record.get("pane") and self._live_agent(record.get("name")):
+                raise FlowError("Escalation fixer is already live after incomplete startup; inspect and adopt-startup instead of reconfiguring it")
             if record.get("session") or record.get("pane") or record.get("status") not in {"not_started", "needs_fix", None}:
                 raise FlowError(
                     f"{role} selection is immutable after its persistent session starts. "
@@ -798,6 +809,48 @@ class Workflow:
             )
             self.registry.update(state, store.state_path)
             return state
+
+    def adopt_startup(self, store: TaskStore, *, pane: str, model: str, variant: str, yes: bool = False) -> dict[str, Any]:
+        """Adopt a named Codex escalation session stalled by first-run onboarding."""
+        HerdrAdapter.require_context()
+        if not yes:
+            raise FlowError("Inspect the live Codex pane and confirm adoption with --yes")
+        if not pane or not model or variant != "high":
+            raise FlowError("Specify the existing pane, exact model, and verified high reasoning level")
+        validate_agent_selection("codex", model, variant)
+        with file_lock(store.root / ".drive.lock"):
+            with store.locked() as state:
+                self._hydrate_repair_state(state)
+                role = "escalation_fixer"
+                record = state.get(role)
+                if state["phase"] not in {"REVIEW_FAILED", "FINAL_REVIEW_FAILED"} or state["repair"].get("active_role") != role or not record:
+                    raise FlowError("Only a selected, stalled escalation fixer can be adopted")
+                if record.get("pane") or record.get("session") or record.get("terminal_id") or state["prompts"].get(role):
+                    raise FlowError("Escalation fixer already has recorded identity or prompt; inspect before recovery")
+                marker = Path(state["project"].get("worktree_path") or "") / ".herdr-flow-task.json"
+                if not marker.is_file():
+                    raise FlowError("Task worktree ownership marker is missing")
+                owner = read_json(marker)
+                if owner.get("task_id") != store.task_id or owner.get("source_root") != str(self.source_root):
+                    raise FlowError("Task worktree ownership marker does not match")
+                live = self._live_agent(record["name"])
+                if not live or live.get("name") != record["name"] or live.get("agent") != "codex" or live.get("pane_id") != pane or live.get("workspace_id") != state["project"]["workspace_id"] or live.get("agent_status") not in {"idle", "done"} or not live.get("interactive_ready") or not live.get("terminal_id"):
+                    raise FlowError("Named Codex session is not idle in the confirmed task pane; no new session was started")
+                if Path(live.get("cwd") or "").resolve() != Path(state["project"]["worktree_path"]).resolve():
+                    raise FlowError("Codex is not running in the task worktree")
+                if model != "gpt-6-sol":
+                    raise FlowError("This recovery supports only the confirmed GPT-6-Sol high selection")
+                screen = self.herdr.read_agent(record["name"], lines=80)
+                displayed = re.findall(r"(?i)\bGPT[- ]6[- ]Sol\s+(minimal|low|medium|high|xhigh|max|ultra)\b", screen)
+                if not displayed or displayed[-1].lower() != "high":
+                    raise FlowError("Codex screen does not confirm GPT-6-Sol high as its latest displayed model; change /model in the same pane first")
+                record.update({"model": model, "variant": variant, "pane": pane, "workspace": live["workspace_id"],
+                               "terminal_id": live["terminal_id"], "session": live.get("agent_session"),
+                               "status": live["agent_status"], "last_seen_at": utc_now()})
+                state["automation"]["attention"] = None
+                store.event(state, "STARTUP_SESSION_ADOPTED", role, f"Verified existing Codex pane {pane}; {model} {variant}; no prompt sent")
+                self.registry.update(state, store.state_path)
+                return state
 
     def implement(self, store: TaskStore, *, force_resend: bool = False) -> dict[str, Any]:
         HerdrAdapter.require_context()
@@ -1717,11 +1770,21 @@ class Workflow:
     def _ensure_repair_agent(self, state: dict[str, Any], role: str, worktree: Path, anchor_pane: str) -> tuple[dict[str, Any], bool]:
         if role not in {"fixer", "escalation_fixer"} or not state.get(role):
             raise FlowError(f"Repair role is not configured: {role}")
-        live = self._live_agent(state[role].get("name"))
+        record = state[role]
+        live = self._live_agent(record.get("name"))
+        if role == "escalation_fixer" and live and not record.get("pane") and not record.get("session"):
+            raise FlowError("Escalation fixer is live but startup identity was not recorded; inspect its pane and use adopt-startup before advancing")
+        if record.get("terminal_id"):
+            if not live or live.get("pane_id") != record.get("pane") or live.get("terminal_id") != record["terminal_id"] or live.get("agent") != record["kind"] or (record.get("session") and live.get("agent_session") != record["session"]):
+                raise FlowError("Adopted repair session identity changed; inspect its pane, do not restart or resend")
+            screen = self.herdr.read_agent(record["name"], lines=80)
+            displayed = re.findall(r"(?i)\bGPT[- ]6[- ]Sol\s+(minimal|low|medium|high|xhigh|max|ultra)\b", screen)
+            if not displayed or displayed[-1].lower() != "high":
+                raise FlowError("Adopted Codex no longer confirms GPT-6-Sol high; inspect /model before advancing")
         if live:
-            self._sync_agent(state[role], live)
+            self._sync_agent(record, live)
             return live, False
-        pane = state[role].get("pane")
+        pane = record.get("pane")
         if not pane or not self._pane_available_for_start(pane):
             created = self.herdr.create_tab(state["project"]["workspace_id"], worktree, role.replace("_", "-"))
             pane = created["root_pane"]["pane_id"]
@@ -1746,6 +1809,15 @@ class Workflow:
         return self.herdr.agent(name) if name else None
 
     def _submit_once(self, store: TaskStore, state: dict[str, Any], role: str, prompt: str, *, force_resend: bool = False, target: str | None = None) -> None:
+        if role == "escalation_fixer" and state[role].get("terminal_id"):
+            owner = state[role]
+            live = self._live_agent(owner["name"])
+            if not live or live.get("pane_id") != owner["pane"] or live.get("terminal_id") != owner["terminal_id"] or live.get("agent") != "codex" or (owner.get("session") and live.get("agent_session") != owner["session"]):
+                raise FlowError("Adopted Codex session identity changed before prompt; refusing delivery")
+            screen = self.herdr.read_agent(owner["name"], lines=80)
+            displayed = re.findall(r"(?i)\bGPT[- ]6[- ]Sol\s+(minimal|low|medium|high|xhigh|max|ultra)\b", screen)
+            if not displayed or displayed[-1].lower() != "high":
+                raise FlowError("Adopted Codex no longer confirms GPT-6-Sol high; inspect /model before sending a prompt")
         if role == "coordinator" and not state[role].get("managed"):
             target = state[role].get("pane")
             live = self._live_agent(target) if target else None
@@ -2141,6 +2213,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         if name == "status":
             item.add_argument("--json", action="store_true")
             item.add_argument("--watch", action="store_true")
+    adopt = sub.add_parser("adopt-startup")
+    adopt.add_argument("--task", required=True)
+    adopt.add_argument("--pane", required=True)
+    adopt.add_argument("--model", required=True)
+    adopt.add_argument("--variant", required=True, choices=["high"])
+    adopt.add_argument("--yes", action="store_true")
     configure = sub.add_parser("configure-agent")
     configure.add_argument("--task")
     configure.add_argument("--role", required=True, choices=list(CONFIGURABLE_ROLES))
@@ -2257,6 +2335,8 @@ def main(argv: list[str] | None = None) -> int:
         state = workflow.reconcile_branch(store, args.branch, yes=args.yes)
     elif args.command == "refresh-instructions":
         state = workflow.refresh_instructions(store, yes=args.yes)
+    elif args.command == "adopt-startup":
+        state = workflow.adopt_startup(store, pane=args.pane, model=args.model, variant=args.variant, yes=args.yes)
     elif args.command == "configure-agent":
         state = configure_from_args(workflow, store, args.role, args)
         if state is None:

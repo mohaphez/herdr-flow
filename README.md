@@ -2,7 +2,7 @@
 
 File-backed, persistent multi-agent development workflow for [Herdr](https://herdr.dev). A Claude Code, Codex, or OpenCode coordinator plans a task and performs its final release review. Independent OpenCode/Codex sessions implement, review, and repair in a task-specific Git worktree. **No automatic commit or merge.** Worktree cleanup requires a verified merge, a clean checkout, and ownership checks.
 
-> **Prerelease:** The latest tagged prerelease is v0.8.0; `main` contains an unreleased fix for attached coordinator names. Automated state-machine tests pass; the full live three-harness acceptance scenario in `ACCEPTANCE.md` remains to be performed inside Herdr. The marketplace is an **unreviewed community index**, not a security or quality endorsement. Do not assume race-free operation or unattended production readiness from unit tests alone.
+> **v0.8.2 prerelease:** Automated tests and a live first-run Codex adoption/prompt handoff have been observed, but the full live three-harness acceptance scenario in `ACCEPTANCE.md` remains to be performed inside Herdr. The marketplace is an **unreviewed community index**, not a security or quality endorsement. Do not assume race-free operation or unattended production readiness from unit tests alone.
 
 ## Workflow at a glance
 
@@ -44,7 +44,7 @@ Linux, Python 3.10+ (tested with 3.14), Git, Herdr 0.9.1+, Claude Code, OpenCode
 The marketplace lists public repositories with the `herdr-plugin` GitHub topic and a valid manifest on their default branch. It does not host, vet, or sandbox plugin code. Inspect the [manifest](herdr-plugin.toml), [setup script](install.sh), and source before installing. From a **Herdr-managed pane** on Linux, with the requirements above installed:
 
 ```bash
-herdr plugin install mohaphez/herdr-flow --ref v0.8.0
+herdr plugin install mohaphez/herdr-flow --ref v0.8.2
 herdr plugin action invoke hessam.herdr-flow.setup
 herdr plugin log list --plugin hessam.herdr-flow --limit 5
 herdr-flow doctor
@@ -54,7 +54,7 @@ herdr-flow doctor
 
 Herdr exposes the plugin without setup through `herdr plugin action list --plugin hessam.herdr-flow` and `herdr plugin pane open --plugin hessam.herdr-flow --entrypoint status`. Once setup completes and models are configured, start a task using the planning commands below or `herdr-flow create` **inside Herdr**. The [marketplace documentation](https://herdr.dev/docs/marketplace/) explains discovery: the `herdr-plugin` topic and this default-branch manifest drive indexing, not the GitHub release or tag; refreshes occur about every 30 minutes. A listing is not a Herdr review or endorsement.
 
-Use `herdr plugin config-dir hessam.herdr-flow` to locate the private config directory. After an upgrade/reinstall, inspect existing tasks first and rerun `setup` if the managed checkout path changed; if old symlinks still point at a retired checkout, inspect their ownership and remove only verified stale links before setup. Never install over a different linked checkout or interrupt its live tasks. `--ref v0.8.0` pins this prerelease; omit `--ref` only when you deliberately want the current default-branch version. Herdr has no separate `plugin update` in v1: it reinstalls from GitHub.
+Use `herdr plugin config-dir hessam.herdr-flow` to locate the private config directory. After an upgrade/reinstall, inspect existing tasks first and rerun `setup` if the managed checkout path changed; if old symlinks still point at a retired checkout, inspect their ownership and remove only verified stale links before setup. Never install over a different linked checkout or interrupt its live tasks. `--ref v0.8.2` pins this prerelease; omit `--ref` only when you deliberately want the current default-branch version. Herdr has no separate `plugin update` in v1: it reinstalls from GitHub.
 
 ### Local development or standalone checkout
 
@@ -110,6 +110,7 @@ Run CLI commands that inspect or control live sessions **inside a Herdr-managed 
 | `herdr-flow inspect --task <id> --role <role>` | Herdr pane | Read the recorded live agent before considering recovery or a deliberate resend. |
 | `herdr-flow resume --task <id>` | Herdr pane, recovery | Reuse existing sessions; recover only genuinely missing worker/reviewer sessions. |
 | `herdr-flow advance --task <id>` | Herdr pane, exceptional reconciliation | Reconcile an already-written report without repeating an implementation prompt. |
+| `herdr-flow adopt-startup --task <id> --pane <id> --model gpt-6-sol --variant high --yes` | Herdr pane, only after verifying an existing first-run Codex escalation pane | Adopt the already-idle named Codex session after a blocked startup; require matching worktree, pane, terminal, and latest on-screen GPT-6-Sol high label. Sends no prompt; after status inspection, advance once. |
 | `herdr-flow refresh-instructions --task <id> --yes` | Herdr pane, after review, agents idle | Refresh owned worktree instruction snapshots if main-checkout instructions changed. |
 | `herdr-flow reconcile-branch --task <id> --branch <name> --yes` | Herdr pane, after an unprovable rename in DONE | Explicitly acknowledge the *already checked-out* task branch after inspecting Git; changes only task metadata, never Git refs. |
 | `herdr-flow finalize --task <id>` | Herdr pane, **after human merge** | Remove only a verified merged, clean, owned task worktree; keep branch and task records. |
@@ -145,6 +146,8 @@ New tasks use `feat/<slug>`, `fix/<slug>`, `refactor/<slug>`, `docs/<slug>`, `te
 If you rename a task branch in Git after creation, `finalize` accepts the new checked-out name **only** when the original branch no longer exists and Git's reflog proves the exact rename. It records the change in `project.branch_history` after all merge, cleanliness, and ownership checks pass. If proof is missing or ambiguous, it refuses cleanup with an actionable message: inspect the worktree and, from Herdr, run `herdr-flow reconcile-branch --task <id> --branch <actual-checked-out-name> --yes`, then `finalize`. Reconciliation requires a DONE task and matching task ownership marker; it never renames Git refs or overrides a foreign worktree.
 
 ### Review, recovery, and cleanup
+
+When a *new* Codex escalation fixer is blocked on its first-run trust/model prompts, the start call can fail even though the agent remains alive. **Do not** run `resume`, `configure-agent`, or `resend` over that unrecorded session. Inspect the named agent and its pane from Herdr. This prerelease's recovery path is intentionally limited to a verified **GPT-6-Sol high** session: select that model in the *same* Codex pane, check its latest displayed label, then use `adopt-startup` with that pane ID and `--yes` from another Herdr pane. Adoption records the actual selection and terminal ownership without sending a prompt. Check status before running `advance` once; if already FIXING, do not advance again. Any mismatch halts for human inspection. Ordinary tasks never require adoption.
 
 The independent reviewer must report evidence-backed PASS/FAIL in `review.md`; the coordinator does the same in `final-review.md`. Failures route to the original worker or dedicated fixer. Optional cumulative escalation starts only after the configured number of failures and reuses its own persistent session. Kimi, if chosen as a reviewer model, runs **inside OpenCode**, not Kimi Code CLI.
 

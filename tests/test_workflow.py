@@ -17,7 +17,7 @@ from contextlib import redirect_stdout
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "src"))
 
-from herdr_flow import BRIEF_PLACEHOLDER, FlowError, Workflow, load_config, main, parse_args  # noqa: E402
+from herdr_flow import BRIEF_PLACEHOLDER, FlowError, HerdrAdapter, HerdrError, Workflow, load_config, main, parse_args  # noqa: E402
 
 
 class FakeHerdr:
@@ -788,6 +788,91 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("fixer", fixed["repair"]["active_role"])
         self.assertEqual(1, self.fake.start_count["fixer"])
         self.assertEqual(0, self.fake.start_count["escalation_fixer"])
+
+    def _stalled_first_run_codex(self, displayed="GPT-6-Sol high"):
+        self.workflow.configure_role(self.store, "escalation_fixer", kind="codex", model="gpt-5.6-sol", variant="high", variant_set=True)
+        self.workflow.run_task(self.store)
+        with self.store.locked() as state:
+            state["phase"] = "REVIEW_FAILED"
+            state["repair"]["failure_count"] = 3
+            state["repair"]["escalation"]["after_failures"] = 2
+            state["repair"]["active_role"] = "escalation_fixer"
+            state["escalation_fixer"]["status"] = "needs_fix"
+            state["automation"]["attention"] = "agent_not_ready: blocked during startup"
+            name = state["escalation_fixer"]["name"]
+            path = state["project"]["worktree_path"]
+        self.fake.agents_by_name[name] = {
+            "name": name, "agent": "codex", "agent_status": "idle", "interactive_ready": True,
+            "pane_id": "w-test:p3", "workspace_id": "w-test", "terminal_id": "term-first-run",
+            "cwd": path,
+        }
+        self.fake.read_agent = lambda target, lines=100: f"• Model changed to GPT-6-Sol medium\n{displayed} · {path}"
+        return name
+
+    def test_adapter_reads_raw_herdr_agent_text_and_preserves_errors(self):
+        adapter = HerdrAdapter(binary="/fake/herdr")
+        args = ["/fake/herdr", "agent", "read", "escalator-test", "--source", "recent-unwrapped", "--lines", "80"]
+        screen = "Codex screen\nGPT-6-Sol high · task worktree\n"
+        with patch("herdr_flow.subprocess.run", return_value=subprocess.CompletedProcess(args, 0, screen, "")) as invoked:
+            self.assertEqual(screen, adapter.read_agent("escalator-test", lines=80))
+            invoked.assert_called_once_with(args, text=True, capture_output=True)
+        error = '{"error":{"code":"agent_not_found","message":"Agent is gone"}}'
+        with patch("herdr_flow.subprocess.run", return_value=subprocess.CompletedProcess(args, 1, "", error)):
+            with self.assertRaisesRegex(HerdrError, "agent_not_found: Agent is gone"):
+                adapter.read_agent("escalator-test", lines=80)
+
+    def test_adopt_blocked_first_run_codex_without_new_session_or_prompt_replay(self):
+        name = self._stalled_first_run_codex()
+        sent = len(self.fake.prompts)
+        pending = self.workflow.advance(self.store)
+        self.assertIn("adopt-startup", pending["automation"]["attention"])
+        self.assertEqual(sent, len(self.fake.prompts))
+        with self.assertRaisesRegex(FlowError, "adopt-startup"):
+            self.workflow.configure_role(self.store, "escalation_fixer", model="gpt-6-sol")
+        with self.assertRaisesRegex(FlowError, "--yes"):
+            self.workflow.adopt_startup(self.store, pane="w-test:p3", model="gpt-6-sol", variant="high")
+        adopted = self.workflow.adopt_startup(self.store, pane="w-test:p3", model="gpt-6-sol", variant="high", yes=True)
+        self.assertEqual("REVIEW_FAILED", adopted["phase"])
+        self.assertEqual(sent, len(self.fake.prompts))
+        self.assertEqual("gpt-6-sol", adopted["escalation_fixer"]["model"])
+        self.assertEqual("term-first-run", adopted["escalation_fixer"]["terminal_id"])
+        self.assertIsNone(adopted["prompts"]["escalation_fixer"])
+        with self.assertRaisesRegex(FlowError, "already has recorded identity"):
+            self.workflow.adopt_startup(self.store, pane="w-test:p3", model="gpt-6-sol", variant="high", yes=True)
+        fixed = self.workflow.advance(self.store)
+        self.assertEqual("FIXING", fixed["phase"])
+        self.assertEqual(0, self.fake.start_count["escalation_fixer"])
+        self.assertEqual(1, len([p for _, p in self.fake.prompts if "escalation fixer" in p]))
+        self.assertEqual(name, self.fake.prompts[-1][0])
+        self.assertIn("model gpt-6-sol with high", self.fake.prompts[-1][1])
+        self.workflow.advance(self.store)
+        self.assertEqual(sent + 1, len(self.fake.prompts))
+
+    def test_adoption_rejects_wrong_model_screen_and_changed_terminal(self):
+        name = self._stalled_first_run_codex(displayed="GPT-6-Sol medium")
+        with self.assertRaisesRegex(FlowError, "does not confirm"):
+            self.workflow.adopt_startup(self.store, pane="w-test:p3", model="gpt-6-sol", variant="high", yes=True)
+        self.assertIsNone(self.store.read()["escalation_fixer"]["pane"])
+        self.fake.read_agent = lambda target, lines=100: "GPT-6-Sol high"
+        with self.assertRaisesRegex(FlowError, "confirmed task pane"):
+            self.workflow.adopt_startup(self.store, pane="w-test:p4", model="gpt-6-sol", variant="high", yes=True)
+        self.workflow.adopt_startup(self.store, pane="w-test:p3", model="gpt-6-sol", variant="high", yes=True)
+        self.fake.agents_by_name[name]["terminal_id"] = "term-replacement"
+        before = len(self.fake.prompts)
+        blocked = self.workflow.advance(self.store)
+        self.assertEqual("REVIEW_FAILED", blocked["phase"])
+        self.assertIn("identity changed", blocked["automation"]["attention"])
+        self.assertEqual(before, len(self.fake.prompts))
+
+    def test_adopted_codex_model_drift_blocks_first_prompt(self):
+        self._stalled_first_run_codex()
+        self.workflow.adopt_startup(self.store, pane="w-test:p3", model="gpt-6-sol", variant="high", yes=True)
+        self.fake.read_agent = lambda target, lines=100: "GPT-6-Sol medium"
+        before = len(self.fake.prompts)
+        blocked = self.workflow.advance(self.store)
+        self.assertEqual("REVIEW_FAILED", blocked["phase"])
+        self.assertIn("no longer confirms GPT-6-Sol high", blocked["automation"]["attention"])
+        self.assertEqual(before, len(self.fake.prompts))
 
     def test_fourth_cumulative_failure_escalates_and_reuses_codex_fixer(self):
         original = self.workflow.implement(self.store)
