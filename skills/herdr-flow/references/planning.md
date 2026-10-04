@@ -1,6 +1,6 @@
 # Herdr Flow coordinator planning contract
 
-This contract applies identically to Claude, OpenCode, and Codex coordinators. The initiating agent may be a launcher rather than the coordinator; do not implement the task from the launcher.
+This contract applies identically to Claude, OpenCode, Codex, and Pi coordinators. The initiating agent may be a launcher rather than the coordinator; do not implement the task from the launcher.
 
 1. Read `state.json`, `brief.md` (the original user request), `handoff.md`, `.herdr-flow-context.md` in the task worktree, and applicable project `AGENTS.md`/`CLAUDE.md` instructions. Check whether commands from the main checkout actually work in this isolated worktree; never blindly run Docker commands against shared services or the main checkout.
 2. Investigate the existing architecture, relevant code paths, dependencies, conventions, existing utilities, current behavior, and root cause. Clearly distinguish observed facts from assumptions and recommendations. Do not change production files or configuration; planning only.

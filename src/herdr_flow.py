@@ -29,8 +29,9 @@ PLUGIN_ID = "hessam.herdr-flow"
 SCHEMA_VERSION = 1
 TASK_RE = re.compile(r"^task-[a-z0-9][a-z0-9-]{0,22}$")
 AGENT_NAME_RE = re.compile(r"^[a-z][a-z0-9_-]{0,31}$")
-AGENT_KINDS = {"opencode", "codex"}
-VARIANTS = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
+AGENT_KINDS = {"opencode", "codex", "pi"}
+VARIANTS = {"minimal", "low", "medium", "high", "xhigh", "max", "ultra", "off"}
+PI_THINKING = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
 SESSION_ROLES = ("worker", "fixer", "escalation_fixer", "reviewer")
 CONFIGURABLE_ROLES = ("coordinator", "worker", "fixer", "escalation_fixer", "reviewer")
 BRANCH_TYPES = ("feat", "fix", "refactor", "docs", "test", "chore")
@@ -129,7 +130,7 @@ def git_root(cwd: Path) -> Path:
 
 def validate_agent_selection(kind: str, model: str, variant: str | None = None) -> None:
     if kind not in AGENT_KINDS:
-        raise FlowError(f"Unsupported workflow agent kind: {kind}; choose opencode or codex")
+        raise FlowError(f"Unsupported workflow agent kind: {kind}; choose opencode, codex, or pi")
     if not model or any(char.isspace() for char in model):
         raise FlowError("Agent model must be an exact installed model id without whitespace")
     if variant and variant not in VARIANTS:
@@ -137,11 +138,26 @@ def validate_agent_selection(kind: str, model: str, variant: str | None = None) 
     if kind == "opencode":
         provider = model.split("/", 1)[0] if "/" in model else ""
         if not provider:
-            raise FlowError("OpenCode models must include their provider prefix, for example provider/model-id")
+            raise FlowError("OpenCode models must include their provider prefix, for example provider/model")
         result = run(["opencode", "models", provider], check=False)
         if result.returncode != 0 or model not in set(result.stdout.splitlines()):
             raise FlowError(f"OpenCode model is not available in the local catalog: {model}")
+        if variant:
+            supported = opencode_variants(model)
+            if variant not in supported:
+                raise FlowError(f"OpenCode model {model} does not advertise variant {variant}; available: {', '.join(sorted(supported)) or '(default only)'}")
         return
+    if kind == "pi":
+        if variant and variant not in PI_THINKING:
+            raise FlowError(f"Pi does not support thinking level {variant}")
+        models = pi_models()
+        if model not in models:
+            raise FlowError(f"Pi model is not available in the local catalog: {model}; use provider/model")
+        if variant and variant != "off" and not models[model]:
+            raise FlowError(f"Pi model {model} does not advertise thinking; use off or default")
+        return
+    if variant == "off":
+        raise FlowError("Codex does not advertise reasoning effort off")
     result = run(["codex", "debug", "models"], check=False)
     if result.returncode != 0:
         raise FlowError(f"Could not inspect the Codex model catalog: {(result.stderr or result.stdout).strip()}")
@@ -171,40 +187,70 @@ def plugin_state_dir() -> Path:
 
 
 def global_config_path() -> Path:
-    explicit = os.environ.get("HERDR_FLOW_CONFIG")
-    if explicit:
-        candidate = Path(explicit).expanduser()
-        if not candidate.is_file():
-            raise FlowError(f"HERDR_FLOW_CONFIG does not exist: {candidate}")
-        return candidate
     raw = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
     if raw:
         candidate = Path(raw) / "config.json"
-        if candidate.is_file():
+        if candidate.exists():
             return candidate
-    xdg = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
-    candidate = xdg / "herdr" / "plugins" / "config" / PLUGIN_ID / "config.json"
-    return candidate if candidate.is_file() else plugin_root() / "config.json"
+    return plugin_root() / "config.json"
+
+
+DEFAULT_ROLES = {"coordinator", "worker", "reviewer", "escalation"}
+
+
+def defaults_override_path() -> Path:
+    return plugin_state_dir() / "defaults.json"
+
+
+def read_defaults_override() -> dict[str, Any]:
+    path = defaults_override_path()
+    if not path.exists():
+        return {"schema_version": 1, "roles": {}}
+    data = read_json(path)
+    if (not isinstance(data, dict) or data.get("schema_version") != 1
+            or not isinstance(data.get("roles"), dict)
+            or set(data) != {"schema_version", "roles"}
+            or set(data["roles"]) - DEFAULT_ROLES):
+        raise FlowError(f"Invalid local role defaults in {path}")
+    for role, choice in data["roles"].items():
+        if (not isinstance(choice, dict) or set(choice) != {"kind", "model", "variant"}
+                or not isinstance(choice["kind"], str)
+                or choice["kind"] not in ({"claude", *AGENT_KINDS} if role == "coordinator" else AGENT_KINDS)
+                or (choice["kind"] != "claude" and (not isinstance(choice["model"], str) or not choice["model"] or any(c.isspace() for c in choice["model"])))
+                or (choice["model"] is not None and not isinstance(choice["model"], str))
+                or (choice["kind"] == "claude" and choice["model"] is not None)
+                or (choice["variant"] is not None and (not isinstance(choice["variant"], str) or choice["variant"] not in VARIANTS))
+                or (choice["kind"] == "claude" and choice["variant"] not in {None, "low", "medium", "high", "xhigh", "max"})
+                or (choice["kind"] == "pi" and choice["variant"] not in {None, *PI_THINKING})):
+            raise FlowError(f"Invalid local {role} default in {path}")
+    return data
 
 
 def load_config() -> dict[str, Any]:
     config = read_json(global_config_path())
+    local = read_defaults_override()["roles"]
+    for role, choice in local.items():
+        if role == "escalation":
+            config["repair"]["escalation"]["agent"] = choice.copy()
+        else:
+            config["agents"][role] = choice.copy()
     if config.get("schema_version") != SCHEMA_VERSION:
         raise FlowError(f"Unsupported config schema in {global_config_path()}")
     coordinator = config.get("agents", {}).get("coordinator", {})
     kind, model, variant = coordinator.get("kind"), coordinator.get("model"), coordinator.get("variant")
     if kind not in {"claude", *AGENT_KINDS}:
-        raise FlowError("agents.coordinator.kind must be claude, opencode, or codex")
+        raise FlowError("agents.coordinator.kind must be claude, opencode, codex, or pi")
     if kind != "claude" and (not isinstance(model, str) or not model or any(char.isspace() for char in model)):
         raise FlowError("agents.coordinator.model must be an exact installed model ID for a non-Claude default")
     if variant and (variant not in VARIANTS or (kind == "claude" and variant not in {"low", "medium", "high", "xhigh", "max"})):
         raise FlowError("agents.coordinator.variant is unsupported")
-    for role in ("worker", "reviewer"):
-        agent = config.get("agents", {}).get(role, {})
-        if agent.get("kind") not in AGENT_KINDS:
-            raise FlowError(f"agents.{role}.kind must be opencode or codex")
-        if agent.get("variant") and agent["variant"] not in VARIANTS:
-            raise FlowError(f"agents.{role}.variant is unsupported")
+    reviewer = config.get("agents", {}).get("reviewer", {})
+    if reviewer.get("kind") not in AGENT_KINDS:
+        raise FlowError("agents.reviewer.kind must be opencode, codex, or pi")
+    if not isinstance(reviewer.get("model"), str) or not reviewer["model"] or any(c.isspace() for c in reviewer["model"]):
+        raise FlowError("agents.reviewer.model must be an exact installed model ID")
+    if reviewer.get("variant") and reviewer["variant"] not in VARIANTS:
+        raise FlowError("agents.reviewer.variant is unsupported")
     escalation = config.get("repair", {}).get("escalation", {})
     if escalation.get("enabled"):
         after = escalation.get("after_failures")
@@ -212,7 +258,7 @@ def load_config() -> dict[str, Any]:
             raise FlowError("repair.escalation.after_failures must be a non-negative integer")
         agent = escalation.get("agent", {})
         if agent.get("kind") not in AGENT_KINDS or not agent.get("model"):
-            raise FlowError("repair.escalation.agent must define an opencode/codex kind and exact model")
+            raise FlowError("repair.escalation.agent must define an opencode/codex/pi kind and exact model")
         if agent.get("variant") and agent["variant"] not in VARIANTS:
             raise FlowError("repair.escalation.agent.variant is unsupported")
     return config
@@ -2060,6 +2106,11 @@ class Workflow:
             if variant:
                 args += ["-c", f'model_reasoning_effort="{variant}"']
             return args
+        if record["kind"] == "pi":
+            args = ["--model", model]
+            if variant:
+                args += ["--thinking", variant]
+            return args
         raise FlowError(f"Model arguments are not defined for agent kind {record['kind']}")
 
     @staticmethod
@@ -2074,7 +2125,15 @@ class Workflow:
 def doctor() -> int:
     problems: list[str] = []
     notes: list[str] = []
-    required = ["git", "python3", "herdr", "opencode", "codex", "claude"]
+    required = ["git", "python3", "herdr"]
+    try:
+        selected = load_config()
+        kinds = {selected["agents"][role]["kind"] for role in ("coordinator", "worker", "reviewer")}
+        if selected["repair"]["escalation"].get("enabled"):
+            kinds.add(selected["repair"]["escalation"]["agent"]["kind"])
+        required.extend(sorted(kinds))
+    except FlowError as exc:
+        problems.append(str(exc))
     for command in required:
         path = shutil.which(command)
         if path:
@@ -2091,12 +2150,11 @@ def doctor() -> int:
         notes.append(f"ok  default coordinator: {coordinator['kind']} {coordinator.get('model') or '(current session)'}")
         for role in ("worker", "reviewer"):
             selection = config["agents"][role]
-            if selection.get("model"):
-                validate_agent_selection(selection["kind"], selection["model"], selection.get("variant"))
-                variant = f" @{selection['variant']}" if selection.get("variant") else ""
-                notes.append(f"ok  default {role}: {selection['kind']} {selection['model']}{variant}")
-            else:
-                problems.append(f"default {role} model is not configured; set an installed model in the private Herdr Flow config")
+            validate_agent_selection(selection["kind"], selection["model"], selection.get("variant"))
+            variant = f" @{selection['variant']}" if selection.get("variant") else ""
+            notes.append(f"ok  default {role}: {selection['kind']} {selection['model']}{variant}")
+        if config["agents"]["reviewer"]["kind"] == "opencode" and "kimi" in config["agents"]["reviewer"]["model"].lower():
+            notes.append("ok  default reviewer uses OpenCode with a Kimi model (no Kimi CLI)")
         escalation = config["repair"]["escalation"]
         if escalation.get("enabled"):
             agent = escalation["agent"]
@@ -2172,8 +2230,150 @@ def add_agent_selection_args(parser: argparse.ArgumentParser, prefix: str = "") 
         f"--{option}variant",
         dest=f"{dest}variant",
         choices=["default", *sorted(VARIANTS)],
-        help="OpenCode variant or Codex/Claude reasoning effort; 'default' clears an inherited value",
+        help="OpenCode variant or Pi/Codex/Claude thinking effort; 'default' clears an inherited value",
     )
+
+
+def pi_models() -> dict[str, bool]:
+    """Read Pi's installed provider/model table and its advertised thinking flag."""
+    result = run(["pi", "--list-models"], check=False)
+    if result.returncode != 0:
+        raise FlowError(f"Could not list Pi models: {(result.stderr or result.stdout).strip()}")
+    models: dict[str, bool] = {}
+    for line in result.stdout.splitlines():
+        fields = line.split()
+        if len(fields) >= 5 and fields[0] != "provider" and fields[4] in {"yes", "no"}:
+            models[f"{fields[0]}/{fields[1]}"] = fields[4] == "yes"
+    if not models:
+        raise FlowError("Pi returned no parseable provider/model rows; check pi --list-models")
+    return models
+
+
+def opencode_variants(model: str) -> set[str]:
+    """Read effective OpenCode metadata, not a model's generic reasoning flag."""
+    provider = model.split("/", 1)[0]
+    if not provider:
+        raise FlowError("OpenCode models require a provider prefix")
+    result = run(["opencode", "models", provider, "--verbose"], check=False)
+    if result.returncode != 0:
+        raise FlowError(f"Could not inspect OpenCode variants: {(result.stderr or result.stdout).strip()}")
+    match = re.search(rf"(?m)^{re.escape(model)}\r?\n", result.stdout)
+    if not match:
+        raise FlowError(f"OpenCode model not found in effective catalog: {model}")
+    try:
+        details, _ = json.JSONDecoder().raw_decode(result.stdout[match.end():].lstrip())
+    except json.JSONDecodeError as exc:
+        raise FlowError(f"Invalid OpenCode model metadata for {model}") from exc
+    variants = details.get("variants")
+    if not isinstance(variants, dict):
+        raise FlowError(f"OpenCode did not provide variant metadata for {model}")
+    return set(variants) & VARIANTS
+
+
+def _menu(label: str, options: list[str]) -> str:
+    if not options:
+        raise FlowError(f"No choices found for {label}")
+    print(f"\n{label}:")
+    for number, item in enumerate(options, 1):
+        print(f"  {number}. {item}")
+    while True:
+        try:
+            answer = input("Choose number (or q to cancel): ").strip()
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise FlowError("Switch cancelled; no defaults changed") from exc
+        if answer.lower() == "q":
+            raise FlowError("Switch cancelled; no defaults changed")
+        if answer.isdigit() and 1 <= int(answer) <= len(options):
+            return options[int(answer) - 1]
+        print("Enter a number from the list.")
+
+
+def _catalog(kind: str) -> list[str]:
+    if kind == "opencode":
+        result = run(["opencode", "models"], check=False)
+        if result.returncode != 0:
+            raise FlowError(f"Could not list OpenCode models: {(result.stderr or result.stdout).strip()}")
+        return sorted(set(result.stdout.splitlines()))
+    if kind == "pi":
+        return sorted(pi_models())
+    result = run(["codex", "debug", "models"], check=False)
+    if result.returncode != 0:
+        raise FlowError(f"Could not list Codex models: {(result.stderr or result.stdout).strip()}")
+    try:
+        return [item["slug"] for item in json.loads(result.stdout)["models"]]
+    except (ValueError, KeyError, TypeError) as exc:
+        raise FlowError("Codex returned an invalid model catalog") from exc
+
+
+def _choose_model(kind: str) -> str:
+    models = _catalog(kind)
+    while True:
+        try:
+            query = input(f"Search {kind} model (name or provider; q cancels): ").strip()
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise FlowError("Switch cancelled; no defaults changed") from exc
+        if query.lower() == "q":
+            raise FlowError("Switch cancelled; no defaults changed")
+        matching = [model for model in models if query.lower() in model.lower()]
+        if 0 < len(matching) <= 30:
+            return _menu("Model", matching)
+        print(f"{len(matching)} matches; narrow the search to 1–30 models.")
+
+
+def switch_default(args: argparse.Namespace) -> None:
+    role = args.role
+    if not role:
+        if not sys.stdin.isatty():
+            raise FlowError("Non-interactive switch requires --role")
+        role = _menu("Role", ["coordinator", "worker", "reviewer", "escalation"])
+    local = read_defaults_override()
+    if args.reset:
+        if any(value is not None for value in (args.kind, args.model, args.variant)):
+            raise FlowError("--reset cannot be combined with kind, model, or variant")
+        local["roles"].pop(role, None)
+        write_json(defaults_override_path(), local)
+        print(f"Reset {role} to the repository default; existing tasks unchanged")
+        return
+    interactive = sys.stdin.isatty()
+    if not interactive and (not args.kind or (args.kind != "claude" and not args.model)):
+        raise FlowError("Non-interactive switch requires --role, --kind, and --model (except for Claude)")
+    kind = args.kind or _menu("Agent", ["claude", "codex", "opencode", "pi"] if role == "coordinator" else ["codex", "opencode", "pi"])
+    if kind == "claude" and role != "coordinator":
+        raise FlowError("Only the coordinator supports an unpinned Claude session")
+    if kind == "claude" and args.model:
+        raise FlowError("Use an unpinned Claude coordinator, without --model")
+    model = None if kind == "claude" else (args.model or _choose_model(kind))
+    if args.variant is not None:
+        variant = None if args.variant == "default" else args.variant
+    elif interactive:
+        if kind == "claude":
+            levels = ["default", *sorted(VARIANTS - {"minimal", "ultra"})]
+        elif kind == "opencode":
+            levels = ["default", *sorted(opencode_variants(model))]
+        elif kind == "pi":
+            levels = ["default", "off"] if not pi_models()[model] else ["default", *sorted(PI_THINKING)]
+        else:
+            levels = ["default", *sorted(VARIANTS)]
+        variant = _menu("Thinking / variant", levels)
+        variant = None if variant == "default" else variant
+    else:
+        variant = None
+    if kind != "claude":
+        validate_agent_selection(kind, model, variant)
+    elif variant not in {None, "low", "medium", "high", "xhigh", "max"}:
+        raise FlowError("Unsupported Claude effort")
+    choice = {"kind": kind, "model": model, "variant": variant}
+    if interactive:
+        print(f"\nNew {role} default: {json.dumps(choice)}")
+        try:
+            confirm = input("Save for future tasks? [y/N]: ").strip().lower()
+        except (EOFError, KeyboardInterrupt) as exc:
+            raise FlowError("Switch cancelled; no defaults changed") from exc
+        if confirm not in {"y", "yes"}:
+            raise FlowError("Switch cancelled; no defaults changed")
+    local["roles"][role] = choice
+    write_json(defaults_override_path(), local)
+    print(f"Saved {role} default to {defaults_override_path()}; existing tasks unchanged")
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -2182,6 +2382,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("doctor")
     sub.add_parser("defaults")
+    switch = sub.add_parser("switch", help="Pick a new role default for future tasks (interactive without flags)")
+    switch.add_argument("--role", choices=sorted(DEFAULT_ROLES))
+    switch.add_argument("--kind", choices=["claude", "codex", "opencode", "pi"])
+    switch.add_argument("--model", help="Exact model ID; prompts from installed catalog if omitted")
+    switch.add_argument("--variant", choices=["default", *sorted(VARIANTS)], help="Reasoning effort or OpenCode variant; default clears it")
+    switch.add_argument("--reset", action="store_true", help="Remove this role's local override")
     sub.add_parser("init")
     create = sub.add_parser("create")
     create.add_argument("--title", required=True)
@@ -2279,8 +2485,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "doctor":
         return doctor()
     if args.command == "defaults":
-        selected = load_config()["agents"]["coordinator"]
-        print(json.dumps({key: selected.get(key) for key in ("kind", "model", "variant")}, indent=2))
+        config = load_config()
+        roles = {role: (config["repair"]["escalation"]["agent"] if role == "escalation" else config["agents"][role]) for role in ("coordinator", "worker", "reviewer", "escalation")}
+        print(json.dumps({role: {key: choice.get(key) for key in ("kind", "model", "variant")} for role, choice in roles.items()}, indent=2))
+        return 0
+    if args.command == "switch":
+        switch_default(args)
         return 0
     if args.command == "status-popup":
         HerdrAdapter().status_popup()

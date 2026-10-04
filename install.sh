@@ -6,7 +6,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)
 id=hessam.herdr-flow
 [[ ${HERDR_ENV:-} == 1 ]] || { echo "Run this installer inside a Herdr-managed pane (HERDR_ENV=1)." >&2; exit 1; }
 herdr_bin=${HERDR_BIN_PATH:-herdr}
-for tool in python3 git opencode codex claude jq; do
+for tool in python3 git jq; do
   command -v "$tool" >/dev/null || { echo "Missing command: $tool" >&2; exit 1; }
 done
 command -v "$herdr_bin" >/dev/null || { echo "Missing Herdr binary: $herdr_bin" >&2; exit 1; }

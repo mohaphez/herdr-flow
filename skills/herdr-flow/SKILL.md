@@ -1,9 +1,9 @@
 ---
 name: herdr-flow
 description: Coordinate persistent multi-agent development tasks through the local Herdr Flow plugin. Use when planning, implementing, reviewing, fixing, resuming, or checking a `.ai/workflow` task whose worker and reviewer sessions must be reused.
-compatibility: Requires Herdr 0.9.1+, OpenCode, Claude Code, Git, and the local `herdr-flow` command.
+compatibility: Requires Herdr 0.9.1+, Git, `herdr-flow`, and installed CLIs for the selected agent kinds.
 metadata:
-  owner: local
+  owner: herdr-flow
   workflow: persistent-multi-agent
 ---
 
@@ -15,7 +15,7 @@ Herdr Flow keeps task state in `.ai/workflow/<task-id>/` and keeps live worker/r
 
 1. One task owns one persistent implementation worker.
 2. Ordinary repair failures reuse that worker unless the task defines a dedicated fixer. Automatic escalation creates/reuses one separate escalation fixer after the configured cumulative failure threshold; it never destroys the cheaper session.
-3. The independent reviewer is a separate persistent OpenCode or Codex session. Choose an installed model in the private config before creating tasks; Kimi, if selected, is an OpenCode model, never Kimi Code CLI.
+3. The independent reviewer is a separate persistent OpenCode, Codex, or Pi session. Inspect effective role defaults with `herdr-flow defaults` and switch them with `herdr-flow switch` (role, agent, catalog model, thinking/variant prompts). Defaults are local overrides, not changes to this skill or the tracked config. Kimi always means a model inside OpenCode, never Kimi Code CLI.
 4. Files are the record; prompts are short references.
 5. A blocked agent waits for the user in the same pane.
 6. A replacement session is allowed only when the prior session is genuinely absent.
@@ -37,6 +37,6 @@ herdr-flow finalize --task task-001
 
 The branch uses a conventional type and title slug (e.g. `refactor/optimize-formbuilder-queries-and-caching`); use `--branch-type` to override inference, and append the task ID only on collision. Existing tasks keep their original recorded names. A Git-verified branch rename can be reconciled at finalize; ambiguous renames require explicit `reconcile-branch --branch <checked-out-name> --yes` from Herdr after inspecting the worktree. Automation does not invent decisions, bypass blocked sessions, repeat uncertain prompts, or perform Git commits/merges. Its event-driven cleanup also checks for a verified merge; `finalize` is the deterministic fallback when Git itself emitted no Herdr event.
 
-Run `herdr-flow defaults` to inspect the single global coordinator default (private Herdr plugin config, initialized from the repository template). New tasks inherit it without coordinator flags; explicit flags win and existing task selections never change. From Claude/OpenCode use `/ai-plan <request>`; from Codex use `$herdr-flow-plan <request>` or compatibility `/prompts:ai-plan <request>`. A launcher from a different harness starts a dedicated coordinator and does not become its owner. Coordinator, worker, dedicated fixer, escalation fixer, and reviewer kind/model/variant may be selected per task. For a Codex or OpenCode coordinator, create with `--coordinator-kind codex|opencode --coordinator-model <exact-id> [--coordinator-variant <effort>]` and run `herdr-flow start-coordinator --task <id>` inside Herdr. It launches a task-owned coordinator to plan and call `herdr-flow run` itself. The coordinator must be a separate session/pane from the worker, even if using the same harness. An unpinned Claude coordinator can still use the existing attached pane. Never replace a live coordinator or blindly resend its prompt. Use exact model IDs and configure a role only before its persistent session starts. Omitting a dedicated fixer reuses the worker for ordinary repairs. When optional escalation is enabled, failures beyond the configured threshold route to one persistent escalation fixer; subsequent repairs reuse that session.
+Run `herdr-flow defaults` to inspect effective role defaults, and `herdr-flow switch` to change them through short prompts. The repository config supplies portable fallbacks; local overrides live outside Git. New tasks inherit effective defaults without role flags; explicit flags win and existing task selections never change. From Claude/OpenCode use `/ai-plan <request>`; from Codex use `$herdr-flow-plan <request>` or compatibility `/prompts:ai-plan <request>`; from Pi use `/skill:herdr-flow-plan <request>`. A launcher from a different harness starts a dedicated coordinator and does not become its owner. Coordinator, worker, dedicated fixer, escalation fixer, and reviewer kind/model/variant may be selected per task. For a Codex, OpenCode, or Pi coordinator, create with `--coordinator-kind codex|opencode|pi --coordinator-model <exact-id> [--coordinator-variant <effort>]` and run `herdr-flow start-coordinator --task <id>` inside Herdr. It launches a task-owned coordinator to plan and call `herdr-flow run` itself. The coordinator must be a separate session/pane from the worker, even if using the same harness. An unpinned Claude coordinator can still use the existing attached pane. Never replace a live coordinator or blindly resend its prompt. Use exact model IDs and configure a role only before its persistent session starts. Omitting a dedicated fixer reuses the worker for ordinary repairs. The configured failure threshold triggers the selected escalation fixer; subsequent repairs reuse that session.
 
 Use `herdr-flow status`, `focus`, `inspect`, and `resume` for human interaction and recovery. Never resend a possibly delivered prompt without first using `inspect`; `resend --yes` is deliberately guarded.

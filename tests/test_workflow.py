@@ -130,6 +130,14 @@ class WorkflowTests(unittest.TestCase):
         subprocess.run(["git", "commit", "-qm", "init"], cwd=self.repo, check=True)
         self.previous_config_env = os.environ.get("HERDR_FLOW_CONFIG")
         os.environ["HERDR_FLOW_CONFIG"] = str(ROOT / "config.json")
+        self.previous_plugin_config_dir = os.environ.get("HERDR_PLUGIN_CONFIG_DIR")
+        config_dir = self.root / "config"
+        config_dir.mkdir()
+        fixture = json.loads((ROOT / "config.json").read_text())
+        fixture["agents"]["worker"]["model"] = "example/worker"
+        fixture["agents"]["reviewer"]["model"] = "example/reviewer"
+        (config_dir / "config.json").write_text(json.dumps(fixture))
+        os.environ["HERDR_PLUGIN_CONFIG_DIR"] = str(config_dir)
         os.environ["HERDR_ENV"] = "1"
         os.environ["HERDR_PLUGIN_STATE_DIR"] = str(self.root / "plugin-state")
         os.environ["HERDR_PANE_ID"] = "w-coordinator:p1"
@@ -146,6 +154,10 @@ class WorkflowTests(unittest.TestCase):
 
     def tearDown(self):
         self.validation_patch.stop()
+        if self.previous_plugin_config_dir is None:
+            os.environ.pop("HERDR_PLUGIN_CONFIG_DIR", None)
+        else:
+            os.environ["HERDR_PLUGIN_CONFIG_DIR"] = self.previous_plugin_config_dir
         if self.previous_config_env is None:
             os.environ.pop("HERDR_FLOW_CONFIG", None)
         else:
@@ -271,7 +283,7 @@ class WorkflowTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output):
             self.assertEqual(0, main(["defaults"]))
-        self.assertEqual("claude", json.loads(output.getvalue())["kind"])
+        self.assertEqual("claude", json.loads(output.getvalue())["coordinator"]["kind"])
         root = ROOT
         for name in ("claude/ai-plan.md", "opencode/ai-plan.md", "opencode/ai-run.md", "codex/ai-plan.md", "codex/ai-run.md"):
             path = root / "commands" / name
@@ -1006,6 +1018,65 @@ class WorkflowTests(unittest.TestCase):
         self.assertEqual("DONE", done["phase"])
         self.assertEqual("PASS", done["review"]["status"])
         self.assertEqual("PASS", done["final_review"]["status"])
+
+
+    def test_pi_interactive_picker_uses_installed_model_and_thinking(self):
+        from herdr_flow import defaults_override_path
+        with patch("herdr_flow.sys.stdin.isatty", return_value=True), \
+             patch("herdr_flow._catalog", return_value=["example/think"]), \
+             patch("herdr_flow.pi_models", return_value={"example/think": True}), \
+             patch("herdr_flow.validate_agent_selection"), \
+             patch("builtins.input", side_effect=["2", "3", "think", "1", "1", "y"]), \
+             redirect_stdout(io.StringIO()):
+            main(["switch"])
+        self.assertEqual({"kind": "pi", "model": "example/think", "variant": None},
+                         json.loads(defaults_override_path().read_text())["roles"]["worker"])
+
+    def test_pi_role_launch_and_future_task_switch(self):
+        from herdr_flow import defaults_override_path
+        original = self.store.read()["reviewer"].copy()
+        store = self.workflow.create("Pi coordination", "task-pi", coordinator={"kind": "pi", "model": "example/think", "variant": "max"}, worker={"kind": "pi", "model": "example/think", "variant": "off"})
+        (store.root / "brief.md").write_text("Implement the Pi request.\n")
+        self.workflow.start_coordinator(store)
+        coordinator = store.read()["coordinator"]
+        self.assertEqual(["--model", "example/think", "--thinking", "max"], self.fake.start_args["coordinator"])
+        os.environ["HERDR_PANE_ID"] = coordinator["pane"]
+        self.workflow.run_task(store)
+        self.workflow.implement(store)
+        self.assertEqual(["--model", "example/think", "--thinking", "off"], self.fake.start_args["worker"])
+        self.assertNotEqual(coordinator["pane"], store.read()["worker"]["pane"])
+        with redirect_stdout(io.StringIO()):
+            main(["switch", "--role", "reviewer", "--kind", "pi", "--model", "example/think", "--variant", "high"])
+        self.assertEqual("pi", load_config()["agents"]["reviewer"]["kind"])
+        self.assertEqual(original, self.store.read()["reviewer"])
+        self.assertEqual("pi", Workflow.discover(self.repo, herdr=self.fake).create("New task", "task-after-switch").read()["reviewer"]["kind"])
+        self.assertEqual(0o600, defaults_override_path().stat().st_mode & 0o777)
+        with redirect_stdout(io.StringIO()):
+            main(["switch", "--role", "reviewer", "--reset"])
+        self.assertEqual(original["kind"], load_config()["agents"]["reviewer"]["kind"])
+
+
+class PiCatalogTests(unittest.TestCase):
+    def test_exact_provider_model_and_thinking_validation(self):
+        from herdr_flow import pi_models, validate_agent_selection, _catalog
+        output = "provider  model  context  max-out  thinking  images\nexample  think  200K  32K  yes  no\nexample  tiny  8K  2K  no  no\n"
+        with patch("herdr_flow.run", return_value=subprocess.CompletedProcess([], 0, output, "")):
+            self.assertEqual({"example/think": True, "example/tiny": False}, pi_models())
+            self.assertIn("example/think", _catalog("pi"))
+            validate_agent_selection("pi", "example/think", "high")
+            validate_agent_selection("pi", "example/tiny", "off")
+            with self.assertRaisesRegex(FlowError, "does not advertise thinking"):
+                validate_agent_selection("pi", "example/tiny", "high")
+            with self.assertRaisesRegex(FlowError, "not available"):
+                validate_agent_selection("pi", "think")
+            with self.assertRaisesRegex(FlowError, "does not support thinking"):
+                validate_agent_selection("pi", "example/think", "ultra")
+
+    def test_missing_catalog_fails_closed(self):
+        from herdr_flow import pi_models
+        with patch("herdr_flow.run", return_value=subprocess.CompletedProcess([], 0, "invalid", "")):
+            with self.assertRaisesRegex(FlowError, "no parseable"):
+                pi_models()
 
 
 if __name__ == "__main__":
